@@ -40,7 +40,7 @@ The card also has **No theme** and **Close**.
 
 From the command line: `/gpu-theme <name>` (every session), `/gpu-theme <name> session` (this session only),
 `/gpu-theme list`, `/gpu-theme status`, `/gpu-theme off` (add `session` to clear this session only).
-A session's own choice wins over the all-sessions one. Other open sessions take an all-sessions change at their next start.
+A session's own choice wins over the all-sessions one. Other open sessions follow an all-sessions Apply within a few seconds, unless they have their own. An all-sessions "off" reaches them at their next start, so that it never wipes another plugin's theme.
 
 The window has one backdrop. A pick on theme-examples' own `/custom-theme` card replaces this mod's theme in that
 window; pick on `/gpu-theme` again to bring it back. Under Reduce Motion, or where the app plays no shader, the still

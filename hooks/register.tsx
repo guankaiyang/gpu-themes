@@ -43,6 +43,8 @@ const CHOICE_KEY = 'theme'
 const SESSION_PREFIX = 'session:'
 const SESSIONS_KEPT = 200
 const PREVIEW_MS = 20_000
+// How often an open session checks whether another one applied a theme to every session.
+const FOLLOW_MS = 3_000
 const SCENE_PREFIX = 'gpu-'
 const WINDOWS = ['light', 'dark'] as const
 
@@ -129,6 +131,10 @@ const themeOfScene = (scene: string): GpuTheme | undefined =>
 // The loader reads this reference: both names are written as string literals.
 const choice = atom({ plugin: 'gpu-themes', key: 'choice' } as const, {}, { shape: 'choice-1' })
 let previewEnding: Timer | undefined
+// The check that keeps an open session on the all-sessions choice; started at each session start.
+let following: Timer | undefined
+// True while a follow check runs.
+let checking = false
 // True once the app has said it takes no theme sounds; a reload learns it again.
 let appLacksSound = false
 // Counts the preview timers started; a timer's end acts only if it is still the last one (an apply calls it off).
@@ -167,7 +173,11 @@ async function sessionKey($: EngineInterface): Promise<string | undefined> {
 async function sessionChoice($: EngineInterface): Promise<string | null | undefined> {
   const key = await sessionKey($)
   if (key === undefined) return undefined
-  const kept = await orNothing(() => $.store.get(key))
+  return ownOf(await orNothing(() => $.store.get(key)))
+}
+
+/** Reads a stored own choice: a theme's id, null for "none", or undefined where it holds none. */
+function ownOf(kept: unknown): string | null | undefined {
   if (typeof kept !== 'object' || kept === null || !('theme' in kept)) return undefined
   const theme = (kept as { theme: unknown }).theme
   if (theme === null) return null
@@ -176,7 +186,11 @@ async function sessionChoice($: EngineInterface): Promise<string | null | undefi
 
 /** The choice every session follows unless it has its own. */
 async function allChoice($: EngineInterface): Promise<string | undefined> {
-  const stored = await orNothing(() => $.store.get(CHOICE_KEY))
+  return allOf(await orNothing(() => $.store.get(CHOICE_KEY)))
+}
+
+/** Reads the stored all-sessions choice: a theme's id, or undefined for none. */
+function allOf(stored: unknown): string | undefined {
   return typeof stored === 'string' && themeOf(stored) !== undefined ? stored : undefined
 }
 
@@ -266,17 +280,59 @@ async function applyNow($: EngineInterface, id: string | undefined, forAll: bool
   return drawn
 }
 
+/**
+ * The theme this session should show now: where it follows the choice for every session, that choice as the store
+ * holds it, which another session may have changed since this one started. A session with its own choice keeps
+ * what it shows. So does one whose all-sessions choice was taken off, or is a theme this version does not know:
+ * a clear would wipe whatever theme stands, another plugin's included. Rejects where the store cannot be read.
+ */
+async function dueNow($: EngineInterface, now: GpuChoice): Promise<string | undefined> {
+  if (now.scope === 'session') return now.applied
+  const own = await sessionKey($)
+  if (own !== undefined && ownOf(await $.store.get(own)) !== undefined) return now.applied
+  return allOf(await $.store.get(CHOICE_KEY)) ?? now.applied
+}
+
+/** Keeps an open session on the choice for every session; a preview is left to end first. */
+async function followAll($: EngineInterface): Promise<void> {
+  // One check at a time: where the store is slow, checks must not pile up ahead of a person's Apply.
+  if (checking) return
+  checking = true
+  try {
+    await inTurn(async () => {
+      const now = await read($, choice)
+      if (now.preview !== undefined) return
+      const due = await dueNow($, now)
+      if (due === now.applied) return
+      await show($, due)
+      await update($, choice, was => ({ ...was, applied: due, scope: 'all' }))
+    })
+  } finally {
+    checking = false
+  }
+}
+
 /** Ends a look at a theme unless its timer was called off since: back to what the session shows. */
 async function endPreview($: EngineInterface, id: string, mine: number): Promise<void> {
   if (looks !== mine) return
   previewEnding = undefined
   const now = await read($, choice)
   if (now.preview !== id) return
+  // Back to what is due now, so an all-sessions change made during the look shows at once.
+  const back = (await orNothing(() => dueNow($, now))) ?? now.applied
+  let shown = false
   try {
-    await show($, now.applied)
+    await show($, back)
+    shown = true
   } finally {
     // The look is over even where the window could not go back: the card must not say Previewing for good.
-    await update($, choice, was => (was.preview === id ? { ...was, preview: undefined } : was))
+    await update($, choice, was =>
+      was.preview !== id
+        ? was
+        : shown && back !== was.applied
+          ? { ...was, preview: undefined, applied: back, scope: 'all' }
+          : { ...was, preview: undefined },
+    )
   }
 }
 
@@ -427,7 +483,7 @@ async function answer($: EngineInterface, args: string): Promise<string> {
   if (word === 'off') {
     await apply($, undefined, forAll)
     return forAll
-      ? 'GPU theme off for every session. Pick any theme again with /custom-theme or /gpu-theme.'
+      ? 'GPU theme off for every session. Open sessions keep what they show until they start again. Pick any theme again with /custom-theme or /gpu-theme.'
       : 'GPU theme off for this session only.'
   }
 
@@ -437,7 +493,7 @@ async function answer($: EngineInterface, args: string): Promise<string> {
   const drawn = await apply($, theme.id, forAll)
   return (
     (forAll
-      ? `${theme.title} applied to every session. Other open sessions take it at their next start.`
+      ? `${theme.title} applied to every session, open ones included.`
       : `${theme.title} applied to this session only.`) +
     ` Made for ${theme.window} windows.` +
     (drawn ? '' : ' This window may not draw themes yet.')
@@ -558,6 +614,12 @@ export const register: Register = on => {
         await $.ui.log(`the GPU theme could not be shown at the start (${reasonOf(error)})`, { to: 'debug' })
       })
     }
+
+    // From now on, follow what any other session applies to every session.
+    following?.cancel()
+    following = $.clock.every(FOLLOW_MS, () => {
+      void orNothing(() => followAll($))
+    })
 
     return result
   })

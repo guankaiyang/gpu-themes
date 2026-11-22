@@ -1,6 +1,6 @@
 {
   "name": "gpu-themes",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "All 38 theme-examples themes in one picker, the 14 that lagged the chat rebuilt as a still picture plus a GPU shader",
   "license": "Apache-2.0",
   "types": "./types/index.d.ts"

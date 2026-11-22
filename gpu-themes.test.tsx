@@ -47,7 +47,7 @@ const RUN = { command: 'gpu-theme', origin: { kind: 'composer' }, presentation: 
 const CARD = { plugin: 'gpu-themes', surface: 'desktop', component: 'Placed', props: { id: 'gpu-theme-card', plugin: 'gpu-themes' } } as const
 
 /** Stands for the engine: records every theme set and clear. */
-type Fail = { set?: (scene: string) => boolean; store?: boolean }
+type Fail = { set?: (scene: string) => boolean; store?: boolean; get?: boolean; noSession?: boolean }
 
 function engine(on: Parameters<Parameters<typeof test>[1]>[1], fail: Fail = {}, placed = true) {
   const shown: (string | undefined)[] = []
@@ -56,6 +56,7 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], fail: Fail = {}, 
   // The store in memory, readable by the test.
   const store = new Map<string, unknown>()
   on('store.get', async (_, e) => {
+    if (fail.get) throw new Error('store down')
     const key = (e as { key: string }).key
     const value = store.get(key)
     // Holds one read of 'theme' after it is read: a session start still in progress.
@@ -91,7 +92,7 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], fail: Fail = {}, 
     shown.push(undefined)
     return { value: { isDrawn: false, reason: 'cleared' } }
   })
-  on('session.id', () => ({ value: 'test-session' }))
+  on('session.id', () => ({ value: fail.noSession ? '' : 'test-session' }))
   on('env.get', () => ({ value: undefined }))
   on('command.register', () => ({ value: { command: 'gpu-theme' } }))
   on('session.start', (_, e) => ({ cwd: (e as { cwd: string }).cwd }))
@@ -383,5 +384,115 @@ test('a theme with a twin names it on the card', async ($, on) => {
   await $.command.run({ ...RUN, args: '' })
   const ui = await $.ui.mount(CARD)
   expect((await ui.find({ type: 'Text', text: /For dark windows: Koi Pond, Night/ }))).toBeDefined()
+  await ui.unmount()
+})
+
+// --- Open sessions follow an Apply made in another one ---
+
+const START = { cwd: '/', surface: 'desktop', isInteractive: true } as const
+
+test('an open session follows what another session applies to every session, and its "off"', async ($, on) => {
+  const { shown, store, clock } = engine(on)
+  store.set('theme', 'koi-mosaic')
+  await $.session.start(START)
+  expect(shown.at(-1)).toBe('gpu-koi-mosaic')
+  // Another session applies Honu Lagoon to every session: it writes the shared store.
+  store.set('theme', 'honu-lagoon')
+  await clock.advance(3_000)
+  expect(shown.at(-1)).toBe('gpu-honu-lagoon')
+  expect((await $.command.run({ ...RUN, args: 'status' })).text).toMatch(/Honu Lagoon .* every session/)
+  // Nothing new: nothing is set again.
+  const before = shown.length
+  await clock.advance(9_000)
+  expect(shown.length).toBe(before)
+  // Another session turns it off for every session: this one keeps what it shows (a clear could wipe another
+  // plugin's theme), until it starts again.
+  store.delete('theme')
+  await clock.advance(9_000)
+  expect(shown.length).toBe(before)
+  await $.session.start(START)
+  expect(shown.length).toBe(before)
+})
+
+test('a theme this version does not know, applied elsewhere, changes nothing here', async ($, on) => {
+  const { shown, store, clock } = engine(on)
+  store.set('theme', 'koi-mosaic')
+  await $.session.start(START)
+  const before = shown.length
+  store.set('theme', 'a-theme-from-a-later-version')
+  await clock.advance(9_000)
+  expect(shown.length).toBe(before)
+})
+
+test("this session's own Apply for every session is not set again by the follow check", async ($, on) => {
+  const { shown, clock } = engine(on)
+  await $.session.start(START)
+  await $.command.run({ ...RUN, args: 'honu-lagoon' })
+  const before = shown.length
+  await clock.advance(9_000)
+  expect(shown.length).toBe(before)
+})
+
+test('a This session choice with no session id to store it under is not undone by the follow check', async ($, on) => {
+  const { shown, store, clock } = engine(on, { noSession: true })
+  store.set('theme', 'koi-mosaic')
+  await $.session.start(START)
+  await $.command.run({ ...RUN, args: 'vector-range session' })
+  expect(shown.at(-1)).toBe('gpu-vector-range')
+  store.set('theme', 'honu-lagoon')
+  await clock.advance(9_000)
+  expect(shown.at(-1)).toBe('gpu-vector-range')
+})
+
+test('a store that cannot be read leaves the window alone during the follow check', async ($, on) => {
+  const fail: Fail = {}
+  const { shown, store, clock } = engine(on, fail)
+  store.set('theme', 'koi-mosaic')
+  await $.session.start(START)
+  const before = shown.length
+  fail.get = true
+  await clock.advance(9_000)
+  expect(shown.length).toBe(before)
+  // Readable again: the next check follows.
+  fail.get = false
+  store.set('theme', 'honu-lagoon')
+  await clock.advance(3_000)
+  expect(shown.at(-1)).toBe('gpu-honu-lagoon')
+})
+
+test('a session with its own choice does not follow an all-sessions change', async ($, on) => {
+  const { shown, store, clock } = engine(on)
+  store.set('theme', 'koi-mosaic')
+  store.set('session:test-session', { theme: 'vector-range' })
+  await $.session.start(START)
+  expect(shown.at(-1)).toBe('gpu-vector-range')
+  const before = shown.length
+  store.set('theme', 'honu-lagoon')
+  await clock.advance(9_000)
+  expect(shown.length).toBe(before)
+})
+
+test('with nothing due and nothing of ours shown, the follow check leaves the window alone', async ($, on) => {
+  const { shown, clock } = engine(on)
+  await $.session.start(START)
+  await clock.advance(30_000)
+  expect(shown.length).toBe(0)
+})
+
+test('a preview is not cut short by an all-sessions change; the change follows once it ends', async ($, on) => {
+  const { shown, store, clock } = engine(on)
+  store.set('theme', 'koi-mosaic')
+  await $.session.start(START)
+  await $.command.run({ ...RUN, args: '' })
+  const ui = await $.ui.mount(CARD)
+  await ui.press({ key: 'preview-snow-pines' })
+  expect(shown.at(-1)).toBe('gpu-snow-pines')
+  store.set('theme', 'honu-lagoon')
+  await clock.advance(9_000)
+  expect(shown.at(-1)).toBe('gpu-snow-pines')
+  await clock.advance(15_000)
+  // Straight to the new choice when the look ends: the old one is not shown again first.
+  expect(shown.slice(-3)).toEqual(['gpu-koi-mosaic', 'gpu-snow-pines', 'gpu-honu-lagoon'])
+  expect((await $.command.run({ ...RUN, args: 'status' })).text).toMatch(/Honu Lagoon .* every session/)
   await ui.unmount()
 })
