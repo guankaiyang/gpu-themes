@@ -1,0 +1,13 @@
+gpu-themes
+
+This product includes software derived from the theme-examples plugin for Claude Code by Anthropic,
+licensed under the Apache License, Version 2.0.
+
+Changes from theme-examples:
+- hooks/scenes/{koi-mosaic,snow-pines,halftone,plotter-tide,deep-water,night-reef,paper-garden,honu-lagoon,
+  dither-dunes,vector-range}/: rewritten. Each original CSS-animated scene is redrawn as a still SVG (still.ts)
+  plus a GPU shader (shader.ts) for its moving parts.
+- hooks/register.tsx: new. The theme table, picker card, commands and backdrop drawing for this plugin.
+- hooks/scenes/{classic,blueprint,braille-stars,departure-board,teletext-clouds}.ts,
+  hooks/scenes/{duck-pond,falling-sand,field-lines,garden-beetles,koi-pond,ripple-tank,sea-sparkle,semicolony,
+  star-chart}/ and hooks/sounds.ts: copied unchanged.

@@ -1,0 +1,5 @@
+{
+  "name": "gpu-themes",
+  "owner": { "name": "guankaiyang" },
+  "plugins": [{ "name": "gpu-themes", "source": "./" }]
+}

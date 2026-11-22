@@ -1,0 +1,10 @@
+import { test } from 'claude-code/testing'
+import { THEMES } from './hooks/themes'
+
+test('dump css-animated scenes', async () => {
+  for (const theme of THEMES) {
+    if (theme.shader !== undefined) continue
+    const svg = theme.scene()
+    console.log('@@SCENE@@' + JSON.stringify({ id: theme.id, blur: (theme.glass as { blur?: number }).blur ?? 16, window: theme.window, svg }))
+  }
+})

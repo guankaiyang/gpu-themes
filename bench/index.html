@@ -1,0 +1,37 @@
+<!doctype html><html><head><meta charset="utf-8"><title>bench</title>
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#888}
+#bg{position:fixed;inset:0}#bg svg{width:100%;height:100%;display:block}
+.panel{position:fixed;left:12%;right:12%;top:6%;bottom:22%;border-radius:16px;background:rgba(240,240,240,.4)}
+.panel2{position:fixed;left:12%;right:12%;bottom:4%;height:12%;border-radius:16px;background:rgba(240,240,240,.4)}
+#out{position:fixed;left:8px;top:8px;font:12px monospace;color:#000;background:#fff8;z-index:9}
+</style></head><body><div id="bg"></div><div class="panel"></div><div class="panel2"></div><pre id="out"></pre>
+<script>
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+async function measure(ms) {
+  const d = []; let last = performance.now(); const end = last + ms
+  await new Promise(res => { function f(t) { d.push(t - last); last = t; if (t < end) requestAnimationFrame(f); else res() } requestAnimationFrame(f) })
+  d.shift(); d.sort((a, b) => a - b)
+  const sum = d.reduce((a, b) => a + b, 0)
+  return { fps: +(1000 * d.length / sum).toFixed(1), p95: +d[Math.floor(d.length * .95)].toFixed(1), slow: +(100 * d.filter(x => x > 25).length / d.length).toFixed(0) }
+}
+async function run(ids) {
+  const scenes = await (await fetch('scenes.json')).json()
+  const res = []
+  const list = [{ id: 'none', blur: 16 }, ...scenes.filter(s => !ids || ids.includes(s.id))]
+  for (const s of list) {
+    const bg = document.getElementById('bg')
+    bg.innerHTML = s.id === 'none' ? '' : await (await fetch(s.id + '.svg')).text()
+    for (const p of document.querySelectorAll('.panel,.panel2')) { p.style.backdropFilter = `blur(${s.blur}px)`; p.style.webkitBackdropFilter = `blur(${s.blur}px)` }
+    await sleep(1500)
+    await fetch('/mark?e=start&id=' + s.id, { method: 'POST' })
+    const m = await measure(5000)
+    await fetch('/mark?e=end&id=' + s.id, { method: 'POST' })
+    res.push({ id: s.id, blur: s.blur, ...m })
+    document.getElementById('out').textContent = res.map(r => JSON.stringify(r)).join('\n')
+  }
+  window.__result = res
+  return res
+}
+window.run = run
+if (location.search.includes('autorun')) run().then(r => fetch('/result', { method: 'POST', body: JSON.stringify(r) }))
+</script></body></html>
