@@ -50,6 +50,11 @@ wipes another plugin's theme.
 When the theme changes, the app fades from the old scene to the new one. A scene's moving parts then fade in over its
 still picture in under a second, instead of popping in.
 
+Koi Pond (and Koi Pond, Night) shows what Claude is doing in that session: midges over the water while your turn
+runs, more and faster as tool calls come quickly, leaves falling for half a minute after a file is written, the fish sinking after
+a tool call fails, gathering by the message box while Claude asks you something, and a small fish for each helper
+agent at work. The mod only watches these; it changes nothing Claude does.
+
 The window has one backdrop. A pick on theme-examples' own `/custom-theme` card replaces this mod's theme in that
 window; pick on `/gpu-theme` again to bring it back. Under Reduce Motion, or where the app plays no shader, the still
 shows alone.

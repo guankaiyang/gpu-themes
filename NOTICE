@@ -12,5 +12,10 @@ Changes from theme-examples:
   scene.ts: copied, then changed so the scene fades in over its still when its shader starts: a first pass, a
   one-texel clock, notes the first frame, and the picture and the shapes drawn over it rise with it.
 - The rewritten scenes' shader.ts files fade in the same way.
+- hooks/scenes/koi-pond/scene.ts: while the person is waited for, the koi swim as they always do but in a band low
+  around the message box, no higher than the middle of the lower-right lily pad: each follows a slow wandering
+  point of its own, with a soft roof, floor and sides. Those near the box rise to the surface and open their mouths
+  at it now and then. The original drew them to fixed places in a fan above the box, under the app's frosted text.
+  A leaf falls every 2 seconds while something is written, not every 5.
 - hooks/scenes/{classic,blueprint,braille-stars,departure-board,teletext-clouds}.ts, star-chart/ (its first frame
   is already its still), the still.ts files of the scenes above, and hooks/sounds.ts: copied unchanged.

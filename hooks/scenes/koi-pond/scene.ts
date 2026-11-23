@@ -416,7 +416,8 @@ const mood: Buffer = buffer({ size: [2, 1], float: 32, filter: 'nearest' }, (p):
   // only says how lively the work is, not whether there is any.)
   const working = max(isBusy, step(0.5, session.helpers))
   let midge = mod(m.z + dt * working * (0.16 + 0.18 * min(session.pace, 3)), 4096)
-  let leaf = mod(m.w + dt * 0.2 * step(0.5, session.making), 4096)
+  // gpu-themes: a leaf every 2 seconds while something is written (the original let one fall every 5).
+  let leaf = mod(m.w + dt * 0.5 * step(0.5, session.making), 4096)
   if (first) {
     since = 99
     mended = 99
@@ -451,36 +452,29 @@ const fish: Buffer = buffer({ size: [8, 4], float: 32, filter: 'nearest' }, (p):
   let trn = s1.y
   let gulp = s1.z
   let rise = s1.w
-  // The message box, and this koi's place at it (used when the person is waited for). The app's text lies
-  // over the middle of the pond like frosted glass, so the four koi that keep to the banks take places in
-  // the open water at the two sides of it, and the three roamers a fan above the box itself. All of them
-  // face the box.
+  // The message box, and where this koi swims while the person is waited for. gpu-themes: the koi swim as they
+  // always do, but in a band low around the box, no higher than the middle of the lower-right lily pad. Each
+  // follows a slow wandering point of its own across the band, a body length clear of the window's sides. (The
+  // original drew them to fixed places in a fan above the box, under the app's frosted text.)
   const known = step(0.001, composer.z - composer.x)
   const boxL = mix(0.257, composer.x, known) * size.x
   const boxR = mix(0.743, composer.z, known) * size.x
+  const boxBottom = mix(0.04, composer.y, known) * size.y
   const boxTop = mix(0.13, composer.w, known) * size.y
-  const boxMid = vec2((boxL + boxR) * 0.5, boxTop)
-  const fanR = (boxR - boxL) * 0.3
-  const slotAt = pick7(
-    [
-      vec2(boxL - 34 * u, boxTop + 165 * u),
-      vec2(boxR + 34 * u, boxTop + 205 * u),
-      vec2(boxMid + vec2(0, fanR)),
-      vec2(boxL - 22 * u, boxTop + 330 * u),
-      vec2(boxR + 22 * u, boxTop + 365 * u),
-      vec2(boxMid + vec2(0.5, 0.8) * fanR),
-      vec2(boxMid + vec2(-0.5, 0.8) * fanR),
-    ],
-    i,
+  const boxMid = vec2((boxL + boxR) * 0.5, (boxBottom + boxTop) * 0.5)
+  const roof = 330 * u
+  const bandAt = vec2(
+    clamp((0.5 + 0.44 * sin(time * (0.045 + 0.006 * i) + i * 1.9)) * size.x, L + 20 * u, max(L + 20 * u, size.x - L - 20 * u)),
+    mix(110 * u, roof - 60 * u, 0.5 + 0.5 * sin(time * (0.06 + 0.008 * i) + i * 2.7)),
   )
-  const faceBox = vec2(normalize(vec2(boxMid - slotAt)))
   if (first) {
     // A start in the middle of a wait (the engine starts a scene afresh now and then) begins with the koi
     // already at the box, so nothing is seen to jump.
     const init = pick7(K_INIT, i)
     const atBox = step(0.5, session.waiting)
-    pos = vec2(mix(vec2(init.xy * size), vec2(slotAt - faceBox * L * 0.33), atBox))
-    th = mix(init.z, atan(faceBox.y, faceBox.x), atBox)
+    pos = vec2(mix(vec2(init.xy * size), bandAt, atBox))
+    // In the band a koi starts level, facing the middle, so a long one's tail is not left below the window.
+    th = mix(init.z, bandAt.x < size.x * 0.5 ? 0 : PI, atBox)
     v = 8 * u
     ph = i * 1.3
     trn = 0
@@ -531,10 +525,12 @@ const fish: Buffer = buffer({ size: [8, 4], float: 32, filter: 'nearest' }, (p):
   // comes and hovers in a fan round the box, facing it, mouths up, as pond koi do for someone at the edge.
   // Food still comes first.
   const called = step(0.5, session.waiting) * (1 - hasFood)
-  const toSlot = length(vec2(slotAt - mouth))
-  const there = called * smoothstep(90 * u, 25 * u, toSlot)
-  goal = mix(goal, vec2(slotAt - dir * L * 0.3), called)
-  want = mix(want, 95 * u * smoothstep(12 * u, 260 * u, toSlot), called)
+  // gpu-themes: a waiting koi swims to its wandering point in the band at its own cruising pace; one that comes
+  // near the box rises to the surface and now and then opens its mouth at it.
+  const offBox = vec2(max(max(boxL - mouth.x, mouth.x - boxR), 0), max(mouth.y - boxTop, 0))
+  const there = called * smoothstep(220 * u, 80 * u, length(offBox))
+  goal = mix(goal, bandAt, called)
+  want = mix(want, pick7(K_CRUISE, i) * u * smoothstep(30 * u, 230 * u, length(vec2(bandAt - pos))) + 6 * u, called)
   // When a turn ends, the gold one rolls at the surface, and then they all glide off from the box for a while.
   const since = mood.at(vec2(0, 0)).y
   const roll = (i > 1.5 && i < 2.5 ? 1 : 0) * step(since, 1.3) * sin(PI * clamp(since / 1.3, 0, 1))
@@ -569,13 +565,22 @@ const fish: Buffer = buffer({ size: [8, 4], float: 32, filter: 'nearest' }, (p):
     smoothstep(mrg, -mrg, pos.y) - smoothstep(size.y - mrg, size.y + mrg, pos.y),
   )
   const to = vec2(goal - pos)
-  const toBox = vec2(boxMid - pos)
-  const toN = vec2(mix(vec2(to / max(length(to), 1)), vec2(toBox / max(length(toBox), 1)), there))
+  // gpu-themes: a koi near the box no longer turns to face it; it keeps swimming (the original faced the box).
+  const toN = vec2(to / max(length(to), 1))
+  // The band's soft roof, floor and sides while waiting: a koi that rises above the roof turns back down, and a
+  // turning koi's nose and tail are kept in view at the bottom and the sides.
+  const nose = vec2(pos + dir * L * 0.35)
+  const tail = vec2(pos - dir * L * 1.1)
+  const overRoof = called * smoothstep(roof - 70 * u, roof + 10 * u, max(pos.y, mouth.y))
+  const underFloor = called * smoothstep(60 * u, -20 * u, min(nose.y, tail.y))
+  const pastLeft = called * smoothstep(60 * u, -20 * u, min(pos.x, tail.x))
+  const pastRight = called * smoothstep(size.x - 60 * u, size.x + 20 * u, max(pos.x, tail.x))
+  const keepIn = vec2(vec2(pastLeft - pastRight, underFloor - overRoof) * 3)
   // A lazy swerve so that no path is a straight line.
   const wa = (0.6 * sin(time * 0.21 + i * 2.3) + 0.35 * sin(time * 0.37 + i * 4.1)) * (1 - hasFood) * (1 - called)
   const cw = cos(wa)
   const sw = sin(wa)
-  const des = vec2(vec2(toN.x * cw - toN.y * sw, toN.x * sw + toN.y * cw) + sep * (1.1 - mix(0.4, 0.1, working) * hasFood) + flee * 2.5 + inward * 3)
+  const des = vec2(vec2(toN.x * cw - toN.y * sw, toN.x * sw + toN.y * cw) + sep * (1.1 - mix(0.4, 0.1, working) * hasFood) + flee * 2.5 + inward * 3 + keepIn)
   const err = atan(dir.x * des.y - dir.y * des.x, dot(dir, des))
   // A koi going for food turns no faster than one at ease: a big fish that swings half round on the spot sweeps its
   // markings across the water faster than is kind to the eye.

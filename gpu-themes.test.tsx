@@ -664,9 +664,196 @@ test("each shader is given only the values its file declares: a rebuilt scene's 
   for (const id of [...IDS, ...SHADER_IDS]) {
     const ui = await $.ui.mount(backdrop(id))
     const values = (await ui.find({ type: 'Shader' }))?.props.values
-    // Koi Mosaic's shader has one look, and theme-examples' own take nothing from this mod.
+    // Koi Mosaic's shader has one look; Koi Pond takes the session's six; theme-examples' others take nothing.
     if (IDS.includes(id) && id !== 'koi-mosaic') expect(Object.keys(values as object), id).toEqual(['variant'])
+    else if (id.startsWith('koi-pond')) expect(Object.keys(values as object).sort(), id).toEqual(POND_KEYS)
     else expect(values, id).toBeUndefined()
     await ui.unmount()
   }
+})
+
+// --- A name that is no theme's ---
+
+test('a misspelt name suggests the theme it is close to, and applies nothing', async ($, on) => {
+  const { shown, store } = engine(on)
+  for (const [typed, meant] of [['koi moisaic', 'Koi Mosaic (koi-mosaic)'], ['start chart', 'Star Chart (star-chart)']] as const) {
+    const said = await $.command.run({ ...RUN, args: typed })
+    expect(said.text).toBe(`No GPU theme named "${typed}". Did you mean ${meant}?`)
+  }
+  // With "session" after it, the same.
+  expect((await $.command.run({ ...RUN, args: 'koi moisaic session' })).text).toMatch(/Did you mean Koi Mosaic/)
+  expect(shown.length).toBe(0)
+  expect([...store.keys()]).toEqual([])
+})
+
+test('a name close to several themes lists them, closest first, three at most', async ($, on) => {
+  engine(on)
+  const said = (await $.command.run({ ...RUN, args: 'halftone dusc' })).text
+  expect(said.split('\n')).toEqual([
+    'No GPU theme named "halftone dusc". Did you mean:',
+    '  Halftone Dusk (halftone-dusk)',
+    '  Halftone Dawn (halftone-dawn)',
+  ])
+})
+
+test('a name close to none says where to see them all, with no list', async ($, on) => {
+  engine(on)
+  const said = (await $.command.run({ ...RUN, args: 'volcano' })).text
+  expect(said).toBe('No GPU theme named "volcano". /gpu-theme list shows all 38; a name may end with "folder" or "session".')
+  // A misspelt last word is named the same way.
+  expect((await $.command.run({ ...RUN, args: 'koi mosaic sesion' })).text).toMatch(/end with "folder" or "session"/)
+})
+
+// --- Koi Pond's view of the session ---
+
+const POND_KEYS = ['busy', 'helpers', 'making', 'pace', 'trouble', 'waiting']
+type Dollar = Parameters<Parameters<typeof test>[1]>[0]
+type On = Parameters<Parameters<typeof test>[1]>[1]
+type Tool = Parameters<Dollar['tool']['call']>[0]
+type Complete = Parameters<Dollar['turn']['complete']>[0]
+
+/**
+ * The engine, with turns, tool results and AskUserQuestion answered: `helpers` lists the agents `$.agent.list()`
+ * names (a fork is one it does not), and a question waits until `answer()`.
+ */
+function pondEngine(on: On) {
+  const parts = engine(on)
+  const helpers = new Set<string>()
+  const answers: (() => void)[] = []
+  const asked = { open: 0 }
+  on('turn.start', (_, e) => ({ turnId: (e as { turnId: string }).turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  on('agent.list', () => ({ value: [...helpers].map(id => ({ id, description: id, type: 'general-purpose' })) }))
+  on('classic.PostToolUse', () => ({}))
+  on('classic.PostToolUseFailure', () => ({}))
+  on('tool.call', async () => {
+    asked.open += 1
+    await new Promise<void>(done => answers.push(done))
+    return { result: 'answered' }
+  })
+  return { ...parts, helpers, asked, answer: () => answers.shift()?.() }
+}
+
+/** Lets the pond's bookkeeping, which nothing waits for, settle. */
+const settle = () => new Promise(done => setTimeout(done, 30))
+
+async function pond($: Dollar) {
+  await settle()
+  const ui = await $.ui.mount(backdrop('koi-pond'))
+  const values = (await ui.find({ type: 'Shader' }))?.props.values as Record<string, number>
+  await ui.unmount()
+  return values
+}
+
+const ran = ($: Dollar, tool: string, how: { fails?: boolean; interrupt?: boolean; agent?: string } = {}) => {
+  const base = { tool_name: tool, tool_input: {}, tool_use_id: `u-${tool}`, ...(how.agent ? { agent_id: how.agent } : {}) }
+  return how.fails || how.interrupt
+    ? $.classic.PostToolUseFailure({ ...base, error: 'failed', ...(how.interrupt ? { is_interrupt: true } : {}) } as never)
+    : $.classic.PostToolUse({ ...base, tool_response: {} } as never)
+}
+const end = (turnId: string, agentId?: string) =>
+  ({ answer: '', durationMs: 1, isAborted: false, turnId, reason: 'answer', ...(agentId ? { agentId } : {}) }) as Complete
+const QUIET = { busy: 0, pace: 0, waiting: 0, making: 0, trouble: 0, helpers: 0 }
+
+test('Koi Pond is quiet when nothing is happening', async ($, on) => {
+  pondEngine(on)
+  await $.session.start(START)
+  expect(await pond($)).toEqual(QUIET)
+})
+
+test('Koi Pond follows a turn: busy, its pace, a file written, a failure and its mending, then calm', async ($, on) => {
+  const { clock } = pondEngine(on)
+  await $.turn.start({ text: 'fix it', turnId: 't1' })
+  expect(await pond($)).toMatchObject({ busy: 1, pace: 0 })
+  await ran($, 'Write')
+  expect(await pond($)).toMatchObject({ busy: 1, pace: 1, making: 1, trouble: 0 })
+  await clock.advance(25_000)
+  expect((await pond($)).making).toBe(1)
+  await clock.advance(5_000)
+  expect((await pond($)).making).toBe(0)
+  await ran($, 'Bash', { fails: true })
+  expect((await pond($)).trouble).toBe(1)
+  await ran($, 'Read')
+  expect((await pond($)).trouble).toBe(0)
+  // A failed write is a failure, not a file written.
+  await ran($, 'Edit', { fails: true })
+  expect(await pond($)).toMatchObject({ trouble: 1, making: 0 })
+  await $.turn.complete(end('t1'))
+  expect(await pond($)).toEqual(QUIET)
+})
+
+test("Koi Pond's pace rises with the calls of the last 20 seconds, and falls back once they stop", async ($, on) => {
+  const { clock } = pondEngine(on)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  const levels: number[] = []
+  for (let n = 0; n < 6; n += 1) {
+    await ran($, 'Read')
+    levels.push((await pond($)).pace ?? -1)
+  }
+  expect(levels).toEqual([1, 1, 2, 2, 2, 3])
+  await clock.advance(20_000)
+  expect((await pond($)).pace).toBe(0)
+})
+
+test('Koi Pond counts helper agents while they run, four at most; a fork of the engine is no helper', async ($, on) => {
+  const { helpers } = pondEngine(on)
+  for (const id of ['a1', 'a2', 'a3', 'a4', 'a5']) helpers.add(id)
+  for (const id of ['a1', 'a2', 'a3', 'a4', 'a5']) await $.turn.start({ text: 'help', turnId: `t-${id}`, agentId: id })
+  // The engine's own fork (compaction, memory): no agent the list names.
+  await $.turn.start({ text: 'compact', turnId: 't-fork', agentId: 'fork-1' })
+  expect((await pond($)).helpers).toBe(4)
+  // A helper's turn is not yours: you are not busy.
+  expect((await pond($)).busy).toBe(0)
+  // A fork's tool results count for nothing.
+  await ran($, 'Write', { agent: 'fork-1' })
+  expect((await pond($)).making).toBe(0)
+  for (const id of ['a1', 'a2', 'a3', 'a4']) await $.turn.complete(end(`t-${id}`, id))
+  expect((await pond($)).helpers).toBe(1)
+})
+
+test('a result that lands once nothing is at work changes nothing: the pond does not stay troubled', async ($, on) => {
+  const { helpers } = pondEngine(on)
+  // Your turn ends (stopped), then the command it ran fails.
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete({ ...end('t1'), isAborted: true, reason: 'aborted' } as Complete)
+  await ran($, 'Bash', { fails: true })
+  expect(await pond($)).toEqual(QUIET)
+  // A helper fails, then ends: once nothing is at work, calm again.
+  helpers.add('a1')
+  await $.turn.start({ text: 'help', turnId: 't-a1', agentId: 'a1' })
+  await settle()
+  await ran($, 'Bash', { fails: true, agent: 'a1' })
+  expect((await pond($)).trouble).toBe(1)
+  await $.turn.complete(end('t-a1', 'a1'))
+  expect(await pond($)).toEqual(QUIET)
+})
+
+test('an interrupted call (Esc) is no failure', async ($, on) => {
+  pondEngine(on)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await ran($, 'Bash', { interrupt: true })
+  expect((await pond($)).trouble).toBe(0)
+})
+
+test('Koi Pond waits with you while Claude asks you something, until the last question is answered', async ($, on) => {
+  const { answer, asked } = pondEngine(on)
+  const first = $.tool.call({ tool: 'AskUserQuestion', questions: [] } as unknown as Tool)
+  const second = $.tool.call({ tool: 'AskUserQuestion', questions: [], agentId: 'a1' } as unknown as Tool)
+  for (let n = 0; n < 100 && asked.open < 2; n += 1) await new Promise(done => setTimeout(done, 10))
+  expect((await pond($)).waiting).toBe(1)
+  answer()
+  // Every call goes on as it came.
+  expect(await first).toMatchObject({ result: 'answered' })
+  expect((await pond($)).waiting).toBe(1)
+  answer()
+  await second
+  expect((await pond($)).waiting).toBe(0)
+})
+
+test('a reload starts Koi Pond quiet', async ($, on) => {
+  pondEngine(on)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await ran($, 'Bash', { fails: true })
+  await $.session.start(START)
+  expect(await pond($)).toEqual(QUIET)
 })

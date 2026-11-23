@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { GpuChoice } from '../types'
+import type { GpuActivity, GpuChoice } from '../types'
 
 import { stillSvg as deepWaterStill } from './scenes/deep-water/still'
 import { stillSvg as ditherDunesStill } from './scenes/dither-dunes/still'
@@ -128,11 +128,51 @@ const keyOf = (text: string): string =>
 const themeNamed = (text: string): GpuTheme | undefined =>
   THEMES.find(theme => theme.id === keyOf(text) || keyOf(theme.title) === keyOf(text))
 
+/** How many one-letter changes (one added, dropped or swapped for another) turn one text into the other. */
+function distance(a: string, b: string): number {
+  let row = Array.from({ length: b.length + 1 }, (_, j) => j)
+  for (let i = 1; i <= a.length; i += 1) {
+    const next = [i]
+    for (let j = 1; j <= b.length; j += 1) {
+      next[j] = Math.min((row[j] ?? 0) + 1, (next[j - 1] ?? 0) + 1, (row[j - 1] ?? 0) + (a[i - 1] === b[j - 1] ? 0 : 1))
+    }
+    row = next
+  }
+  return row[b.length] ?? 0
+}
+
+/**
+ * The themes whose id or title is only a few letters off the name typed, closest first, three at most. A few: a
+ * third of the name's letters, at least 1 and at most 4.
+ */
+function closeTo(text: string): GpuTheme[] {
+  const typed = keyOf(text)
+  if (typed === '') return []
+  const most = Math.min(4, Math.max(1, Math.floor(typed.length / 3)))
+  return THEMES.map((theme, order) => ({ theme, order, off: Math.min(distance(typed, theme.id), distance(typed, keyOf(theme.title))) }))
+    .filter(near => near.off <= most)
+    .sort((a, b) => a.off - b.off || a.order - b.order)
+    .slice(0, 3)
+    .map(near => near.theme)
+}
+
+/** The answer to a name that is no theme's: the close ones to type instead, or where to see them all. Nothing is applied. */
+function unknownName(name: string): string {
+  const near = closeTo(name)
+  const head = `No GPU theme named "${name}".`
+  // The words a name may end with are named too: a misspelt one leaves the whole as no theme's.
+  if (near.length === 0) return `${head} /${COMMAND} list shows all ${THEMES.length}; a name may end with "folder" or "session".`
+  const [only] = near
+  if (near.length === 1 && only !== undefined) return `${head} Did you mean ${only.title} (${only.id})?`
+  return [`${head} Did you mean:`, ...near.map(theme => `  ${theme.title} (${theme.id})`)].join('\n')
+}
+
 const themeOfScene = (scene: string): GpuTheme | undefined =>
   scene.startsWith(SCENE_PREFIX) ? THEMES.find(theme => theme.id === scene.slice(SCENE_PREFIX.length)) : undefined
 
 // The loader reads this reference: both names are written as string literals.
 const choice = atom({ plugin: 'gpu-themes', key: 'choice' } as const, {}, { shape: 'choice-1' })
+const activity = atom({ plugin: 'gpu-themes', key: 'activity' } as const, {}, { shape: 'activity-1' })
 let previewEnding: Timer | undefined
 // The check that keeps an open session on the all-sessions choice; started at each session start.
 let following: Timer | undefined
@@ -546,7 +586,7 @@ async function answer($: EngineInterface, args: string): Promise<string> {
   }
 
   const theme = themeNamed(name)
-  if (theme === undefined) return `No GPU theme named "${name}". ${list()}`
+  if (theme === undefined) return unknownName(name)
 
   const drawn = await apply($, theme.id, scope)
   return (
@@ -634,8 +674,108 @@ const REBUILT: readonly Scene[] = [
   'dither-dunes', 'vector-range',
 ]
 
+// --- Koi Pond's view of the session ---
+// theme-examples' Koi Pond takes six values a mod may set from what Claude is doing (see the top of its scene.ts):
+// midges while a turn runs, more of them at a faster pace, leaves falling while a file is written, the fish sinking
+// after a failure, gathering at the prompt box while you are asked something, and a small fish for each helper.
+// This mod only watches. It hears a tool's result after the tool has run (classic PostToolUse and PostToolUseFailure),
+// never wrapping the call: a hook on a call would turn off its move to the background and its live output. Each hook
+// returns at once and keeps its books after, so no call or turn waits on the pond.
+
+const PACE_WINDOW_MS = 20_000
+// The pond lets a leaf fall every 2 seconds while `making` is on: 30 seconds gives about fifteen.
+const MAKING_MS = 30_000
+const WRITERS: ReadonlySet<string> = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
+const POND_KEYS = ['busy', 'pace', 'waiting', 'making', 'trouble', 'helpers'] as const
+// What the pond is told is worked out from these; a reload starts them over, and the session start clears the values.
+let mainBusy = false
+// The helper agents at work, by their loop's id: only those `$.agent.list()` names, so the engine's own forks
+// (compaction, memory) are not counted. `finished` keeps a helper's end from being undone by a late count.
+const helpersAtWork = new Set<string>()
+const finished = new Set<string>()
+let asksOpen = 0
+let recentCalls: number[] = []
+let paceCheck: Timer | undefined
+let makingEnd: Timer | undefined
+let told: Promise<unknown> = Promise.resolve()
+// Counts the session's starts: books kept for an earlier one are dropped.
+let era = 0
+
+const paceOf = (calls: number): number => (calls === 0 ? 0 : calls < 3 ? 1 : calls < 6 ? 2 : 3)
+const atWork = (): boolean => mainBusy || helpersAtWork.size > 0
+
+function clearPond(): void {
+  era += 1
+  mainBusy = false
+  helpersAtWork.clear()
+  finished.clear()
+  asksOpen = 0
+  recentCalls = []
+  paceCheck?.cancel()
+  makingEnd?.cancel()
+}
+
+/**
+ * Changes what the pond is told. Changes run one after another, so none is lost to another in flight, and each is
+ * written only where a value changed, so the pond is drawn again only then. Nothing waits for it.
+ */
+function tell($: EngineInterface, change: (was: GpuActivity) => GpuActivity): void {
+  told = told.then(() =>
+    orNothing(async () => {
+      const was = await read($, activity)
+      if (POND_KEYS.every(key => (was[key] ?? 0) === (change(was)[key] ?? 0))) return
+      await update($, activity, last => change(last))
+    }),
+  )
+}
+
+/** Once nothing is at work, the pond is calm: no pace and no trouble. */
+function calmIfIdle($: EngineInterface): void {
+  if (atWork()) return
+  recentCalls = []
+  paceCheck?.cancel()
+  tell($, was => ({ ...was, busy: 0, pace: 0, trouble: 0, helpers: 0 }))
+}
+
+/**
+ * A tool's result: the pace, a file written, a failure or a success. Only yours or a counted helper's, and only while
+ * something is at work: a result that lands later (a stopped command, a helper's after it ended) changes nothing.
+ */
+function noteResult($: EngineInterface, tool: string, failed: boolean, agentId: string | undefined): void {
+  if (!atWork()) return
+  if (agentId !== undefined && !helpersAtWork.has(agentId)) return
+  const mine = era
+  void orNothing(async () => {
+    const now = await $.clock.now()
+    // Checked again: the turn, or the helper, may have ended while the clock was read.
+    if (era !== mine || !atWork() || (agentId !== undefined && !helpersAtWork.has(agentId))) return
+    recentCalls = [...recentCalls.filter(at => now - at < PACE_WINDOW_MS), now]
+    paceCheck?.cancel()
+    // When the calls stop, the pace falls back to nothing once the last has aged out.
+    paceCheck = $.clock.after(PACE_WINDOW_MS, () => {
+      void orNothing(async () => {
+        const later = await $.clock.now()
+        recentCalls = recentCalls.filter(at => later - at < PACE_WINDOW_MS)
+        tell($, was => ({ ...was, pace: paceOf(recentCalls.length) }))
+      })
+    })
+    const wrote = WRITERS.has(tool) && !failed
+    if (wrote) {
+      makingEnd?.cancel()
+      makingEnd = $.clock.after(MAKING_MS, () => tell($, was => ({ ...was, making: 0 })))
+    }
+    const pace = paceOf(recentCalls.length)
+    tell($, was => ({ ...was, pace, trouble: failed ? 1 : 0, ...(wrote ? { making: 1 } : {}) }))
+  })
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    // A new start, or a reload: nothing is known to be running. Cleared in turn after any change still queued.
+    clearPond()
+    tell($, (): GpuActivity => ({}))
+    await told
+
     try {
       await $.command.register({
         name: COMMAND,
@@ -703,6 +843,63 @@ export const register: Register = on => {
     }
   })
 
+  // Your turn, and each helper agent's: busy while yours runs; a helper counted while its runs. Each returns first.
+  on('turn.start', async ($, e, next) => {
+    const started = await next(e)
+    const id = e.agentId
+    if (id === undefined) {
+      mainBusy = true
+      tell($, was => ({ ...was, busy: 1 }))
+    } else {
+      finished.delete(id)
+      const mine = era
+      void orNothing(async () => {
+        const agents = await $.agent.list()
+        if (era !== mine || finished.has(id) || !agents.some(agent => agent.id === id)) return
+        helpersAtWork.add(id)
+        tell($, was => ({ ...was, helpers: helpersAtWork.size }))
+      })
+    }
+    return started
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const ended = await next(e)
+    const id = e.agentId
+    if (id === undefined) {
+      mainBusy = false
+      tell($, was => ({ ...was, busy: 0 }))
+    } else {
+      finished.add(id)
+      helpersAtWork.delete(id)
+      tell($, was => ({ ...was, helpers: helpersAtWork.size }))
+    }
+    calmIfIdle($)
+    return ended
+  })
+
+  // A tool's result, heard after it ran. An interrupted call (Esc) is no failure; a call you declined never gets here.
+  on('classic.PostToolUse', ($, e, next) => {
+    noteResult($, e.tool_name, false, e.agent_id)
+    return next(e)
+  }).catch(($, e, next) => next(e))
+  on('classic.PostToolUseFailure', ($, e, next) => {
+    if (e.is_interrupt !== true) noteResult($, e.tool_name, true, e.agent_id)
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // While Claude asks you something, the pond waits with you. This one tool's calls are wrapped; no other's are.
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+    asksOpen += 1
+    tell($, was => ({ ...was, waiting: 1 }))
+    try {
+      return await next(e)
+    } finally {
+      asksOpen = Math.max(0, asksOpen - 1)
+      if (asksOpen === 0) tell($, was => ({ ...was, waiting: 0 }))
+    }
+  }).catch(($, e, next) => next(e)) // Should this hook fail, the call goes on as it came (next is replay-safe).
+
   on('ui.render', { component: 'Placed' }, async ($, e, next) => {
     if (e.props.plugin !== PLUGIN || e.props.id !== CARD) return next(e)
     const now = await read($, choice)
@@ -719,7 +916,7 @@ export const register: Register = on => {
 
   // Each scene: a still SVG drawn once, the moving parts in a shader on the GPU. The still shows alone where the app
   // plays no shader, under Reduce Motion, or if the shader fails or runs slowly.
-  on('ui.render', { component: 'Backdrop' }, ($, e, next) => {
+  on('ui.render', { component: 'Backdrop' }, async ($, e, next) => {
     if (e.surface !== 'desktop' || e.props.plugin !== PLUGIN) return next(e)
 
     const theme = themeOfScene(e.props.scene)
@@ -769,8 +966,23 @@ export const register: Register = on => {
         return <Shader module="./scenes/field-lines/scene.ts">{still}</Shader>
       case 'garden-beetles':
         return <Shader module="./scenes/garden-beetles/scene.ts">{still}</Shader>
-      case 'koi-pond':
-        return <Shader module="./scenes/koi-pond/scene.ts">{still}</Shader>
+      case 'koi-pond': {
+        // Read here alone, so only Koi Pond is drawn again as the session changes.
+        const now: GpuActivity = (await orNothing(() => read($, activity))) ?? {}
+        const pond = {
+          busy: now.busy ?? 0,
+          pace: now.pace ?? 0,
+          waiting: now.waiting ?? 0,
+          making: now.making ?? 0,
+          trouble: now.trouble ?? 0,
+          helpers: Math.min(4, now.helpers ?? 0),
+        }
+        return (
+          <Shader module="./scenes/koi-pond/scene.ts" values={pond}>
+            {still}
+          </Shader>
+        )
+      }
       case 'ripple-tank':
         return <Shader module="./scenes/ripple-tank/scene.ts">{still}</Shader>
       case 'sea-sparkle':
