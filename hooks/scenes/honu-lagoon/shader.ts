@@ -14,7 +14,10 @@
 import {
   abs, buffer, clamp, dot, floor, fract, int, length, max, min, mix, mod, picture, range, shader, size, table, time,
   unsigned, values, vec2, vec3, vec4,
+  smoothstep,
+  first,
 } from 'claude-code/shader'
+import type { Buffer, Pixel } from 'claude-code/shader'
 
 // The harness always passes a variant; Honu Lagoon has one look, so both draw the same.
 const params = values({ variant: [0, 1] })
@@ -387,7 +390,24 @@ const restAt = (vb: vec2): vec4 => {
   return rest.sample(vec2(at / vec2(1050, 690)))
 }
 
-const view = picture(p => {
+// gpu-themes: the scene fades in when its shader starts, so its moving parts do not pop in over the still. The app
+// crossfades from the old backdrop to this one's still; the shader then rises over the still in FADE_IN seconds,
+// after FADE_WAIT. A one-texel clock notes the first frame, whatever time the app starts the shader's clock at.
+const FADE_WAIT = 0.15
+const FADE_IN = 0.8
+// x: how much of the scene is still hidden, 1 to 0. y: the time the fade starts from. w: 1 once noted.
+const fadeClock: Buffer = buffer({ size: [1, 1], float: 32, filter: 'nearest' }, () => {
+  const last = fadeClock.at(vec2(0, 0))
+  // Frame 0 starts the fade; a clock wiped later (the app may clear buffers) counts as long risen, with no replay.
+  const startAt = last.w > 0.5 ? last.y : first ? time : time - FADE_WAIT - FADE_IN - 1
+  return vec4(1 - smoothstep(startAt + FADE_WAIT, startAt + FADE_WAIT + FADE_IN, time), startAt, 0, 1)
+})
+// The picture or a shape over it, as far as the scene has risen: until then the still shows through.
+function fadingIn(c: vec4): vec4 {
+  return vec4(c * (1 - fadeClock.at(vec2(0, 0)).x))
+}
+
+function viewColor(p: Pixel) {
   const s = scaleOf()
   const vb = vbOf(p.point, s, originOf(s))
   const u = p.px / s
@@ -438,6 +458,7 @@ const view = picture(p => {
   const spark = tag > 63.5 ? motion.at(vec2(tag - 60, 0)).x * clamp((sp.z / 10 - length(vec2(vb - sp.xy))) / u + 0.5, 0, 1) : 0
   acc = over(vec4(vec3(spark), spark), acc)
   return vec4(acc * (params.variant * 0 + 1))
-})
+}
+const view = picture(p => fadingIn(viewColor(p)))
 
-export default shader({ fps: 30, passes: [motion, cells, atlas, ground, poses, rest, view] })
+export default shader({ fps: 30, passes: [fadeClock, motion, cells, atlas, ground, poses, rest, view] })

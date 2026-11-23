@@ -17,8 +17,9 @@
 import {
   abs, buffer, clamp, composer, dt, first, floor, fract, frame, int, max, min, mix, mod, picture, pointers,
   px, scene, shader, sign, size, sqrt, step, table, time, unsigned, vec2, vec3, vec4,
+  smoothstep,
 } from 'claude-code/shader'
-import type { Buffer } from 'claude-code/shader'
+import type { Buffer, Pixel } from 'claude-code/shader'
 
 /** Points per big pixel. */
 const PX = 6
@@ -726,13 +727,31 @@ const draw: Buffer = buffer({ scale: 1 / PX, filter: 'linear' }, (p): vec4 => {
 })
 
 // The picture: each big pixel enlarged, with edges one screen pixel soft so they stay crisp at any sharpness.
-const view = picture(p => {
+// gpu-themes: the scene fades in when its shader starts, so its moving parts do not pop in over the still. The app
+// crossfades from the old backdrop to this one's still; the shader then rises over the still in FADE_IN seconds,
+// after FADE_WAIT. A one-texel clock notes the first frame, whatever time the app starts the shader's clock at.
+const FADE_WAIT = 0.15
+const FADE_IN = 0.8
+// x: how much of the scene is still hidden, 1 to 0. y: the time the fade starts from. w: 1 once noted.
+const fadeClock: Buffer = buffer({ size: [1, 1], float: 32, filter: 'nearest' }, () => {
+  const last = fadeClock.at(vec2(0, 0))
+  // Frame 0 starts the fade; a clock wiped later (the app may clear buffers) counts as long risen, with no replay.
+  const startAt = last.w > 0.5 ? last.y : first ? time : time - FADE_WAIT - FADE_IN - 1
+  return vec4(1 - smoothstep(startAt + FADE_WAIT, startAt + FADE_WAIT + FADE_IN, time), startAt, 0, 1)
+})
+// The picture or a shape over it, as far as the scene has risen: until then the still shows through.
+function fadingIn(c: vec4): vec4 {
+  return vec4(c * (1 - fadeClock.at(vec2(0, 0)).x))
+}
+
+function viewColor(p: Pixel) {
   const at = vec2(p.uv * draw.size)
   const cell = vec2(floor(at))
   const part = vec2(at - cell)
   const grow = PX / px
   const lean = vec2(clamp(part * grow, 0, 0.5) - 0.5 + clamp((part - 1) * grow + 0.5, 0, 0.5))
   return vec4(draw.sample(vec2((cell + 0.5 + lean) / draw.size)).rgb, 1)
-})
+}
+const view = picture(p => fadingIn(viewColor(p)))
 
-export default shader({ fps: 60, passes: [sim, draw, view] })
+export default shader({ fps: 60, passes: [fadeClock, sim, draw, view] })

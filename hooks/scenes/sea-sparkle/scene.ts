@@ -9,7 +9,7 @@ import {
   picture, pointer, pointers, scene, shader, shapes, sin, size, smoothstep, sqrt, step, table, time, unsigned, vec2,
   vec3, vec4,
 } from 'claude-code/shader'
-import type { Buffer } from 'claude-code/shader'
+import type { Buffer, Pixel, Spot } from 'claude-code/shader'
 
 // Inks.
 // Midnight proof: deep ink, slate ink, luminous mint. Morning proof: the same blocks pulled on pale paper,
@@ -302,7 +302,24 @@ const wake: Buffer = buffer({ scale: 0.25, float: 16, filter: 'linear' }, (p): v
 })
 
 // The sea: ground and plankton.
-const sea = picture(p => {
+// gpu-themes: the scene fades in when its shader starts, so its moving parts do not pop in over the still. The app
+// crossfades from the old backdrop to this one's still; the shader then rises over the still in FADE_IN seconds,
+// after FADE_WAIT. A one-texel clock notes the first frame, whatever time the app starts the shader's clock at.
+const FADE_WAIT = 0.15
+const FADE_IN = 0.8
+// x: how much of the scene is still hidden, 1 to 0. y: the time the fade starts from. w: 1 once noted.
+const fadeClock: Buffer = buffer({ size: [1, 1], float: 32, filter: 'nearest' }, () => {
+  const last = fadeClock.at(vec2(0, 0))
+  // Frame 0 starts the fade; a clock wiped later (the app may clear buffers) counts as long risen, with no replay.
+  const startAt = last.w > 0.5 ? last.y : first ? time : time - FADE_WAIT - FADE_IN - 1
+  return vec4(1 - smoothstep(startAt + FADE_WAIT, startAt + FADE_WAIT + FADE_IN, time), startAt, 0, 1)
+})
+// The picture or a shape over it, as far as the scene has risen: until then the still shows through.
+function fadingIn(c: vec4): vec4 {
+  return vec4(c * (1 - fadeClock.at(vec2(0, 0)).x))
+}
+
+function seaColor(p: Pixel) {
   const q = p.point
   const ink = inks()
   const sharp = 1 / p.px
@@ -408,19 +425,12 @@ const sea = picture(p => {
 
   color = mix(color, ink.glow, max(max(peck, grain * thin), spark))
   return vec4(color, 1)
-})
+}
+const sea = picture(p => fadingIn(seaColor(p)))
 
 // The moon jellies.
 const CORNERS = table([[-1, -1], [1, -1], [1, 1], [-1, -1], [1, 1], [-1, 1]])
-const jellyDraw = shapes(
-  { count: 6, instances: JELLY_COUNT, cover: 0.035 },
-  (vertex, instance) => {
-    const row = JELLY.at(instance)
-    const big = jellyBig(row)
-    const local = vec2(CORNERS.at(vertex) * 1.36)
-    return { at: vec2(((jellyHome(row) + local * big) / size) * 2 - 1), a: vec4(local, instance, big) }
-  },
-  spot => {
+const jellyDrawPaint = (spot: Spot): vec4 => {
     const ink = inks()
     const big = spot.a.w
     const sharp = 1 / spot.px
@@ -442,7 +452,16 @@ const jellyDraw = shapes(
     const lit = max(max(rim, rosette), max(ticks, fringe))
     const cover = max(disc * 0.85, lit)
     return vec4(mix(ink.slate, ink.glow, lit) * cover, cover)
+  }
+const jellyDraw = shapes(
+  { count: 6, instances: JELLY_COUNT, cover: 0.035 },
+  (vertex, instance) => {
+    const row = JELLY.at(instance)
+    const big = jellyBig(row)
+    const local = vec2(CORNERS.at(vertex) * 1.36)
+    return { at: vec2(((jellyHome(row) + local * big) / size) * 2 - 1), a: vec4(local, instance, big) }
   },
+  spot => fadingIn(jellyDrawPaint(spot)),
 )
 
 // The fry.
@@ -454,6 +473,18 @@ const fryAbout = (i: number) => {
   const flat = 0.5 + 0.45 * mod(i * 0.53, 1)
   return { at: vec2(cos(turn), flat * sin(turn)) * reach, dir: normalize(vec2(-sin(turn), flat * cos(turn))) }
 }
+const fryDrawPaint = (spot: Spot): vec4 => {
+    const ink = inks()
+    const u = spot.a.x
+    // A sliver with a forked tail, wriggling.
+    const v = abs(spot.a.y - 0.7 * clamp((2 - u) / 6, 0, 1) * sin(u * 0.9 + time * 11 + spot.a.z * 2.3))
+    const t = clamp((u + 3.5) / 9, 0, 1)
+    const body = min(6.2 * t * (1 - t) * (0.5 + 0.5 * t) - v, u + 3.5)
+    const back = clamp((-3 - u) / 3, 0, 1)
+    const tail = min(min(0.35 + 1.5 * back - v, v - (back - 0.45) * 1.6), min(-3 - u, u + 6))
+    const cover = cutOf(max(body, tail), 1.5 / spot.px) * 0.9
+    return vec4(ink.glow * cover, cover)
+  }
 const fryDraw = shapes(
   { count: 6, instances: FRY_COUNT, cover: 0.03 },
   (vertex, instance) => {
@@ -465,18 +496,7 @@ const fryDraw = shapes(
     )
     return { at: vec2((world / size) * 2 - 1), a: vec4(local, instance, 0) }
   },
-  spot => {
-    const ink = inks()
-    const u = spot.a.x
-    // A sliver with a forked tail, wriggling.
-    const v = abs(spot.a.y - 0.7 * clamp((2 - u) / 6, 0, 1) * sin(u * 0.9 + time * 11 + spot.a.z * 2.3))
-    const t = clamp((u + 3.5) / 9, 0, 1)
-    const body = min(6.2 * t * (1 - t) * (0.5 + 0.5 * t) - v, u + 3.5)
-    const back = clamp((-3 - u) / 3, 0, 1)
-    const tail = min(min(0.35 + 1.5 * back - v, v - (back - 0.45) * 1.6), min(-3 - u, u + 6))
-    const cover = cutOf(max(body, tail), 1.5 / spot.px) * 0.9
-    return vec4(ink.glow * cover, cover)
-  },
+  spot => fadingIn(fryDrawPaint(spot)),
 )
 
 // The ray.
@@ -501,19 +521,7 @@ const rayShape = (u: number, v: number, flap: number) => {
   const pelvic = (1 - length(vec2((u + 36) / 7, (abs(v) - 6.5 + 0.25 * (u + 36)) / 3.4))) * 3.4
   return { inside: max(max(wing, head), max(tail, pelvic)) + wobble, s, lead, rear, down, sway }
 }
-const rayDraw = shapes(
-  { count: 6, cover: 0.08 },
-  (vertex, instance) => {
-    const corner = CORNERS.at(vertex)
-    const ray = school.at(vec2(RAY_SLOT, 0))
-    const across = vec2(-ray.w, ray.z)
-    const local = vec2(-39 + corner.x * 90, corner.y * 90)
-    const world = vec2(ray.xy + (ray.zw * local.x + across * local.y) * RAY_BIG)
-    // The luminous block's slip, turned into the ray's own frame.
-    const slip = vec2(dot(SLIP, ray.zw), dot(SLIP, across)) / RAY_BIG
-    return { at: vec2((world / size) * 2 - 1), a: vec4(local, slip) }
-  },
-  spot => {
+const rayDrawPaint = (spot: Spot): vec4 => {
     const ink = inks()
     const edge = RAY_BIG / spot.px
     const flap = sin(time * 1.6 + 0.58)
@@ -560,7 +568,20 @@ const rayDraw = shapes(
     color = mix(color, ink.glow, lit)
     const cover = max(max(body, under), lit)
     return vec4(color * cover, cover)
+  }
+const rayDraw = shapes(
+  { count: 6, cover: 0.08 },
+  (vertex, instance) => {
+    const corner = CORNERS.at(vertex)
+    const ray = school.at(vec2(RAY_SLOT, 0))
+    const across = vec2(-ray.w, ray.z)
+    const local = vec2(-39 + corner.x * 90, corner.y * 90)
+    const world = vec2(ray.xy + (ray.zw * local.x + across * local.y) * RAY_BIG)
+    // The luminous block's slip, turned into the ray's own frame.
+    const slip = vec2(dot(SLIP, ray.zw), dot(SLIP, across)) / RAY_BIG
+    return { at: vec2((world / size) * 2 - 1), a: vec4(local, slip) }
   },
+  spot => fadingIn(rayDrawPaint(spot)),
 )
 
 // The fish.
@@ -579,19 +600,7 @@ const fishShape = (u: number, v0: number, beat: number) => {
   const fin = min(0.95 * (1 - fa / 5.2) - abs(fb), min(fa, 5.2 - fa))
   return { inside: max(max(body, tail), fin), v, side, girth }
 }
-const fishDraw = shapes(
-  { count: 6, instances: FISH_COUNT, cover: 0.05 },
-  (vertex, instance) => {
-    const corner = CORNERS.at(vertex)
-    const fish = school.at(vec2(instance, 0))
-    const big = FISH.at(instance).w
-    const across = vec2(-fish.w, fish.z)
-    const local = vec2(-3.5 + corner.x * 20, corner.y * 12)
-    const world = vec2(fish.xy + (fish.zw * local.x + across * local.y) * big + SLIP)
-    const slip = vec2(dot(SLIP, fish.zw), dot(SLIP, across)) / big
-    return { at: vec2((world / size) * 2 - 1), a: vec4(local, instance, big), b: vec4(slip, 0, 0) }
-  },
-  spot => {
+const fishDrawPaint = (spot: Spot): vec4 => {
     const ink = inks()
     const u = spot.a.x
     const edge = spot.a.w / spot.px
@@ -612,7 +621,20 @@ const fishDraw = shapes(
     color = mix(color, ink.deep, max(max(spine, gill), max(eye, scales)) * shape)
     const cover = max(key, shape)
     return vec4(color * cover, cover)
+  }
+const fishDraw = shapes(
+  { count: 6, instances: FISH_COUNT, cover: 0.05 },
+  (vertex, instance) => {
+    const corner = CORNERS.at(vertex)
+    const fish = school.at(vec2(instance, 0))
+    const big = FISH.at(instance).w
+    const across = vec2(-fish.w, fish.z)
+    const local = vec2(-3.5 + corner.x * 20, corner.y * 12)
+    const world = vec2(fish.xy + (fish.zw * local.x + across * local.y) * big + SLIP)
+    const slip = vec2(dot(SLIP, fish.zw), dot(SLIP, across)) / big
+    return { at: vec2((world / size) * 2 - 1), a: vec4(local, instance, big), b: vec4(slip, 0, 0) }
   },
+  spot => fadingIn(fishDrawPaint(spot)),
 )
 
-export default shader({ fps: 30, passes: [seed, school, wake, sea, jellyDraw, fryDraw, rayDraw, fishDraw] })
+export default shader({ fps: 30, passes: [fadeClock, seed, school, wake, sea, jellyDraw, fryDraw, rayDraw, fishDraw] })

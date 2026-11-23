@@ -5,8 +5,9 @@
 import {
   PI, abs, atan, buffer, clamp, cos, dot, dt, exp, floor, int, length, max, min, mix, normalize, picture, pointerCount,
   pointers, scene, shader, shapes, sin, size, smoothstep, sqrt, step, table, time, unsigned, vec2, vec3, vec4,
+  first,
 } from 'claude-code/shader'
-import type { Buffer } from 'claude-code/shader'
+import type { Buffer, Pixel, Spot } from 'claude-code/shader'
 
 // A small integer mixer: two whole numbers in, 32 scrambled bits out
 const blend = (a: int, b: int): int => {
@@ -342,7 +343,24 @@ const printed = (inkT: number, inkC: number, at: vec2) => {
   )
 }
 
-const water = picture(p => {
+// gpu-themes: the scene fades in when its shader starts, so its moving parts do not pop in over the still. The app
+// crossfades from the old backdrop to this one's still; the shader then rises over the still in FADE_IN seconds,
+// after FADE_WAIT. A one-texel clock notes the first frame, whatever time the app starts the shader's clock at.
+const FADE_WAIT = 0.15
+const FADE_IN = 0.8
+// x: how much of the scene is still hidden, 1 to 0. y: the time the fade starts from. w: 1 once noted.
+const fadeClock: Buffer = buffer({ size: [1, 1], float: 32, filter: 'nearest' }, () => {
+  const last = fadeClock.at(vec2(0, 0))
+  // Frame 0 starts the fade; a clock wiped later (the app may clear buffers) counts as long risen, with no replay.
+  const startAt = last.w > 0.5 ? last.y : first ? time : time - FADE_WAIT - FADE_IN - 1
+  return vec4(1 - smoothstep(startAt + FADE_WAIT, startAt + FADE_WAIT + FADE_IN, time), startAt, 0, 1)
+})
+// The picture or a shape over it, as far as the scene has risen: until then the still shows through.
+function fadingIn(c: vec4): vec4 {
+  return vec4(c * (1 - fadeClock.at(vec2(0, 0)).x))
+}
+
+function waterColor(p: Pixel) {
   const crisp = crispOf(p.px)
   const day = dayOf()
   const ground = vec3(mix(DARK.ground, LIGHT.ground, day))
@@ -406,7 +424,8 @@ const water = picture(p => {
   color = vec3(mix(color, mix(ringTeal, mix(DARK.teal, LIGHT.teal, day), 0.5), max(bubble, frond)))
   color = vec3(mix(color, mix(ringCoral, mix(DARK.coral, LIGHT.coral, day), 0.6), seed))
   return vec4(color, 1)
-})
+}
+const water = picture(p => fadingIn(waterColor(p)))
 
 // The creatures, each a small square laid where the cast says
 // Each pass says how much of a window its squares may cover, and is not drawn if they cover more. The engine counts
@@ -439,16 +458,7 @@ const bladeOf = (u: vec2, long: number, wide: number) => {
 const BEETLE_BIG = 1.5
 
 // Minnows, under the surface: flat tints, bent by the water over them.
-const minnows = shapes(
-  { count: 6, instances: MINNOWS, cover: 0.05, draw: 'triangles' },
-  (v, i) => {
-    const who = MINNOW0 + i
-    const top = cast.at(vec2(who, 0))
-    const bottom = cast.at(vec2(who, 1))
-    const corner = cornerOf(v)
-    return { at: squareAt(top.xy, corner, 30), a: vec4(corner * 30, top.zw), b: vec4(bottom.x, bottom.y * zoomOf(), 0, 0) }
-  },
-  spot => {
+const minnowsPaint = (spot: Spot): vec4 => {
     const crisp = crispOf(spot.px)
     const rel = vec2((spot.a.xy + swayAt(spot.uv) * 1.8) / spot.b.y)
     const nose = spot.a.zw
@@ -463,10 +473,25 @@ const minnows = shapes(
     const fins = toLine(vec2(x, abs(y)), vec2(5, 2.6), vec2(1.5, 6)) - 0.8
     const ink = inside(min(min(body, tail), fins), crisp) * 0.9
     return vec4(mix(DARK.minnow, LIGHT.minnow, dayOf()) * ink, ink)
+  }
+const minnows = shapes(
+  { count: 6, instances: MINNOWS, cover: 0.05, draw: 'triangles' },
+  (v, i) => {
+    const who = MINNOW0 + i
+    const top = cast.at(vec2(who, 0))
+    const bottom = cast.at(vec2(who, 1))
+    const corner = cornerOf(v)
+    return { at: squareAt(top.xy, corner, 30), a: vec4(corner * 30, top.zw), b: vec4(bottom.x, bottom.y * zoomOf(), 0, 0) }
   },
+  spot => fadingIn(minnowsPaint(spot)),
 )
 
 // Shadows lie on the bed, under everything that floats, so they are laid down before the creatures on the surface.
+const leafShadowsPaint = (spot: Spot): vec4 => {
+    const from = vec2(spot.a.xy + swayAt(spot.uv) * 1.6)
+    const u = vec2((from.x * spot.a.z + from.y * spot.a.w) / spot.b.x, (from.y * spot.a.z - from.x * spot.a.w) / spot.b.x)
+    return shaded(inside(bladeOf(u, spot.b.x, spot.b.y), 0.2))
+  }
 const leafShadows = shapes(
   { count: 6, instances: LEAVES, cover: 0.042, draw: 'triangles' },
   (v, i) => {
@@ -475,22 +500,10 @@ const leafShadows = shapes(
     const long = LEAF_LONG[i]! * zoomOf()
     return { at: squareAt(vec2(top.xy + SHADOW * 1.3), corner, long * 1.05 + 14), a: vec4(corner * (long * 1.05 + 14), top.zw), b: vec4(long, LEAF_WIDE[i]!, 0, 0) }
   },
-  spot => {
-    const from = vec2(spot.a.xy + swayAt(spot.uv) * 1.6)
-    const u = vec2((from.x * spot.a.z + from.y * spot.a.w) / spot.b.x, (from.y * spot.a.z - from.x * spot.a.w) / spot.b.x)
-    return shaded(inside(bladeOf(u, spot.b.x, spot.b.y), 0.2))
-  },
+  spot => fadingIn(leafShadowsPaint(spot)),
 )
 
-const striderShadows = shapes(
-  { count: 6, instances: STRIDERS, cover: 0.125, draw: 'triangles' },
-  (v, i) => {
-    const top = cast.at(vec2(i, 0))
-    const corner = cornerOf(v)
-    const big = STRIDER_SIZE[i]! * zoomOf()
-    return { at: squareAt(vec2(top.xy + SHADOW), corner, 41 * big + 12), a: vec4(corner * (41 * big + 12), top.zw), b: vec4(cast.at(vec2(i, 1)).x, big, 0, 0) }
-  },
-  spot => {
+const striderShadowsPaint = (spot: Spot): vec4 => {
     const big = spot.b.y
     const row = spot.b.x
     const nose = spot.a.zw
@@ -504,10 +517,24 @@ const striderShadows = shapes(
         max(inside(length(vec2(s - foreFoot)) - 3.8, edge), inside(bodyOf(s) - 0.5, edge) * 0.7),
       ),
     )
+  }
+const striderShadows = shapes(
+  { count: 6, instances: STRIDERS, cover: 0.125, draw: 'triangles' },
+  (v, i) => {
+    const top = cast.at(vec2(i, 0))
+    const corner = cornerOf(v)
+    const big = STRIDER_SIZE[i]! * zoomOf()
+    return { at: squareAt(vec2(top.xy + SHADOW), corner, 41 * big + 12), a: vec4(corner * (41 * big + 12), top.zw), b: vec4(cast.at(vec2(i, 1)).x, big, 0, 0) }
   },
+  spot => fadingIn(striderShadowsPaint(spot)),
 )
 
 // The beetles' shadows, and the midges', which fall far from them because they are in the air.
+const smallShadowsPaint = (spot: Spot): vec4 => {
+    const from = vec2(spot.a.xy + swayAt(spot.uv))
+    const nose = spot.a.zw
+    return shaded(inside(length(vec2(dot(from, nose) / spot.b.y, nose.x * from.y - nose.y * from.x)) - spot.b.x / spot.b.y, 0.3) * 0.9)
+  }
 const smallShadows = shapes(
   { count: 6, instances: BEETLES + MIDGES, cover: 0.02, draw: 'triangles' },
   (v, i) => {
@@ -519,22 +546,11 @@ const smallShadows = shapes(
     const long = beetle ? 8 * big : 4.2 * big
     return { at: squareAt(vec2(top.xy + SHADOW * (beetle ? 0.7 * big : 1.7)), corner, half), a: vec4(corner * half, top.zw), b: vec4(long, beetle ? 1 : 1.6, 0, 0) }
   },
-  spot => {
-    const from = vec2(spot.a.xy + swayAt(spot.uv))
-    const nose = spot.a.zw
-    return shaded(inside(length(vec2(dot(from, nose) / spot.b.y, nose.x * from.y - nose.y * from.x)) - spot.b.x / spot.b.y, 0.3) * 0.9)
-  },
+  spot => fadingIn(smallShadowsPaint(spot)),
 )
 
 // A crown of droplets where a raindrop has just landed.
-const crowns = shapes(
-  { count: 6, instances: DROPS, cover: 0.024, draw: 'triangles' },
-  (v, i) => {
-    const drop = cast.at(vec2(DROP0 + i, 0))
-    const corner = cornerOf(v)
-    return { at: squareAt(drop.xy, corner, 46), a: vec4(corner * 46, drop.zw), b: vec4(cast.at(vec2(DROP0 + i, 1)).x, 0, 0, 0) }
-  },
-  spot => {
+const crownsPaint = (spot: Spot): vec4 => {
     const crisp = crispOf(spot.px)
     const rel = spot.a.xy
     const fly = clamp(spot.a.z / 0.8, 0, 1)
@@ -544,18 +560,18 @@ const crowns = shapes(
     const bead = length(vec2(rel - vec2(cos(spoke * 0.898), sin(spoke * 0.898)) * far))
     const big = (1.3 + 1.3 * luck) * (1 - fly)
     return printed(spot.b.x * inside(bead - big, crisp) * step(fly, 0.98) * step(0.001, fly), 0, spot.point)
+  }
+const crowns = shapes(
+  { count: 6, instances: DROPS, cover: 0.024, draw: 'triangles' },
+  (v, i) => {
+    const drop = cast.at(vec2(DROP0 + i, 0))
+    const corner = cornerOf(v)
+    return { at: squareAt(drop.xy, corner, 46), a: vec4(corner * 46, drop.zw), b: vec4(cast.at(vec2(DROP0 + i, 1)).x, 0, 0, 0) }
   },
+  spot => fadingIn(crownsPaint(spot)),
 )
 
-const leaves = shapes(
-  { count: 6, instances: LEAVES, cover: 0.05, draw: 'triangles' },
-  (v, i) => {
-    const top = cast.at(vec2(LEAF0 + i, 0))
-    const corner = cornerOf(v)
-    const long = LEAF_LONG[i]! * zoomOf()
-    return { at: squareAt(top.xy, corner, long * 1.38 + 6), a: vec4(corner * (long * 1.38 + 6), top.zw), b: vec4(long, LEAF_WIDE[i]!, LEAF_BITE[i]!, i) }
-  },
-  spot => {
+const leavesPaint = (spot: Spot): vec4 => {
     const crisp = crispOf(spot.px)
     const long = spot.b.x
     const wide = spot.b.y
@@ -577,17 +593,19 @@ const leaves = shapes(
     const beadAt = (m: vec2, r: number) => inside(abs(length(vec2(ut - m)) * long - r) - 0.7, crisp) * step(0.25, length(vec2(ut - m - vec2(0.03, 0.03))) * long / r)
     const beads = max(beadAt(vec2(0.3, -wide * 0.4), 3.2), beadAt(vec2(-0.45, wide * 0.45), 2.3)) * onLeaf
     return printed(max(max(rib, vein), max(shade, beads)), fill, spot.point)
+  }
+const leaves = shapes(
+  { count: 6, instances: LEAVES, cover: 0.05, draw: 'triangles' },
+  (v, i) => {
+    const top = cast.at(vec2(LEAF0 + i, 0))
+    const corner = cornerOf(v)
+    const long = LEAF_LONG[i]! * zoomOf()
+    return { at: squareAt(top.xy, corner, long * 1.38 + 6), a: vec4(corner * (long * 1.38 + 6), top.zw), b: vec4(long, LEAF_WIDE[i]!, LEAF_BITE[i]!, i) }
   },
+  spot => fadingIn(leavesPaint(spot)),
 )
 
-const beetles = shapes(
-  { count: 6, instances: BEETLES, cover: 0.01, draw: 'triangles' },
-  (v, i) => {
-    const top = cast.at(vec2(BEETLE0 + i, 0))
-    const corner = cornerOf(v)
-    return { at: squareAt(top.xy, corner, 22), a: vec4(corner * 22, top.zw), b: vec4(BEETLE_BIG * zoomOf(), 0, 0, 0) }
-  },
-  spot => {
+const beetlesPaint = (spot: Spot): vec4 => {
     const big = spot.b.x
     const w = crispOf(spot.px) * big
     const nose = spot.a.zw
@@ -598,18 +616,18 @@ const beetles = shapes(
     const collar = inside(abs(at.x - 3.4) - 0.55, w) * inside(shell + 1, w)
     const oars = inside(min(toLine(at, vec2(-1.5, 4), vec2(-7, 9.5)), toLine(at, vec2(3, 4), vec2(6.5, 8))) - 0.7, w)
     return printed(inside(shell, w), max(max(seam, collar), oars), spot.point)
+  }
+const beetles = shapes(
+  { count: 6, instances: BEETLES, cover: 0.01, draw: 'triangles' },
+  (v, i) => {
+    const top = cast.at(vec2(BEETLE0 + i, 0))
+    const corner = cornerOf(v)
+    return { at: squareAt(top.xy, corner, 22), a: vec4(corner * 22, top.zw), b: vec4(BEETLE_BIG * zoomOf(), 0, 0, 0) }
   },
+  spot => fadingIn(beetlesPaint(spot)),
 )
 
-const striders = shapes(
-  { count: 6, instances: STRIDERS, cover: 0.1, draw: 'triangles' },
-  (v, i) => {
-    const top = cast.at(vec2(i, 0))
-    const corner = cornerOf(v)
-    const big = STRIDER_SIZE[i]! * zoomOf()
-    return { at: squareAt(top.xy, corner, 41 * big + 4), a: vec4(corner * (41 * big + 4), top.zw), b: vec4(cast.at(vec2(i, 1)).x, big, 0, 0) }
-  },
-  spot => {
+const stridersPaint = (spot: Spot): vec4 => {
     const big = spot.b.y
     const w = crispOf(spot.px) * big
     const row = spot.b.x
@@ -636,19 +654,20 @@ const striders = shapes(
     const eyes = inside(length(vec2(t.x - 12.6, t.y - 1.6)) - 0.95, w)
     const teal = max(max(max(dimple(midFoot, 5.4), dimple(hindFoot, 4.8)), max(dimple(foreFoot, 3), stripe)), max(bands, eyes))
     return printed(teal, coral, spot.point)
+  }
+const striders = shapes(
+  { count: 6, instances: STRIDERS, cover: 0.1, draw: 'triangles' },
+  (v, i) => {
+    const top = cast.at(vec2(i, 0))
+    const corner = cornerOf(v)
+    const big = STRIDER_SIZE[i]! * zoomOf()
+    return { at: squareAt(top.xy, corner, 41 * big + 4), a: vec4(corner * (41 * big + 4), top.zw), b: vec4(cast.at(vec2(i, 1)).x, big, 0, 0) }
   },
+  spot => fadingIn(stridersPaint(spot)),
 )
 
 // Midges dance in the air over the water.
-const midges = shapes(
-  { count: 6, instances: MIDGES, cover: 0.01, draw: 'triangles' },
-  (v, i) => {
-    const top = cast.at(vec2(MIDGE0 + i, 0))
-    const corner = cornerOf(v)
-    const big = cast.at(vec2(MIDGE0 + i, 1)).x * zoomOf()
-    return { at: squareAt(top.xy, corner, 8 * big + 3), a: vec4(corner * (8 * big + 3), top.zw), b: vec4(big, i, 0, 0) }
-  },
-  spot => {
+const midgesPaint = (spot: Spot): vec4 => {
     const big = spot.b.x
     const w = crispOf(spot.px) * big
     const nose = spot.a.zw
@@ -657,10 +676,19 @@ const midges = shapes(
     // Wings beat too fast to see: each prints as a pale fan.
     const wing = (length(vec2((at.x + 1.2 - at.y * 0.45) / 2.3, (at.y - 3) / 3)) - 1) * 2.3
     return printed(inside(wing, w) * 0.7, inside(body, w), spot.point)
+  }
+const midges = shapes(
+  { count: 6, instances: MIDGES, cover: 0.01, draw: 'triangles' },
+  (v, i) => {
+    const top = cast.at(vec2(MIDGE0 + i, 0))
+    const corner = cornerOf(v)
+    const big = cast.at(vec2(MIDGE0 + i, 1)).x * zoomOf()
+    return { at: squareAt(top.xy, corner, 8 * big + 3), a: vec4(corner * (8 * big + 3), top.zw), b: vec4(big, i, 0, 0) }
   },
+  spot => fadingIn(midgesPaint(spot)),
 )
 
 export default shader({
   fps: 30,
-  passes: [cast, tank, water, minnows, leafShadows, striderShadows, smallShadows, crowns, leaves, beetles, striders, midges],
+  passes: [fadeClock, cast, tank, water, minnows, leafShadows, striderShadows, smallShadows, crowns, leaves, beetles, striders, midges],
 })

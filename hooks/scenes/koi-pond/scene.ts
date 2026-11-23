@@ -4,7 +4,7 @@ import {
   mod, normalize, PI, picture, pointers, pow, px, res, scene, shader, shapes, sin, size, smoothstep, sqrt, step,
   time, unsigned, values, vec2, vec3, vec4,
 } from 'claude-code/shader'
-import type { Buffer } from 'claude-code/shader'
+import type { Buffer, Pixel, Spot } from 'claude-code/shader'
 
 // One layout unit: a point in a 1512x945 window, smaller in a smaller one, so the pond keeps its proportions.
 const unitOf = () => sqrt(size.x * size.y) / 1195
@@ -1039,16 +1039,7 @@ const fry = shapes(
 )
 
 // Pellets and midges: one point each.
-const pellets = shapes(
-  { count: 1, instances: 15, cover: 0.03, draw: 'points' },
-  (v, i) => {
-    const u = unitOf()
-    const f = food.at(vec2(i, 0))
-    const grow = smoothstep(0, 0.2, f.z)
-    const k = f.w > 0.75 ? 0.6 + 0.4 * grow : 1 - smoothstep(0, 0.4, f.z)
-    return { at: vec2((f.xy / size) * 2 - 1), size: clamp((22 * u) / px, 1, 64), a: vec4(k, f.w, i, 0), hide: f.w < 0.25 }
-  },
-  s => {
+const pelletsPaint = (s: Spot): vec4 => {
     const m = modeBuf.at(vec2(0, 0)).r
     const d = vec2((s.coord - 0.5) * 2)
     const r = length(d)
@@ -1062,7 +1053,17 @@ const pellets = shapes(
     const ring = smoothstep(0.98, 0.7, r) * smoothstep(rad - 0.05, rad + 0.25, r) * k
     const a = body + (1 - body) * ring * 0.22
     return vec4(c * body, a)
+  }
+const pellets = shapes(
+  { count: 1, instances: 15, cover: 0.03, draw: 'points' },
+  (v, i) => {
+    const u = unitOf()
+    const f = food.at(vec2(i, 0))
+    const grow = smoothstep(0, 0.2, f.z)
+    const k = f.w > 0.75 ? 0.6 + 0.4 * grow : 1 - smoothstep(0, 0.4, f.z)
+    return { at: vec2((f.xy / size) * 2 - 1), size: clamp((22 * u) / px, 1, 64), a: vec4(k, f.w, i, 0), hide: f.w < 0.25 }
   },
+  spot => fadingIn(pelletsPaint(spot)),
 )
 
 // The resting swell: two sets of slow sine trains from all round the compass, one long and one short (the short
@@ -1128,7 +1129,24 @@ const overhead = buffer({ scale: 0.25, once: true, filter: 'linear' }, p => {
 const grain = buffer({ size: [128, 128], once: true, filter: 'nearest', wrap: 'repeat' }, p => vec4(one(p.cell.x, p.cell.y, 131), 0, 0, 1))
 
 // The picture: bottom, light, koi and surface put together through the moving water.
-const view = picture(p => {
+// gpu-themes: the scene fades in when its shader starts, so its moving parts do not pop in over the still. The app
+// crossfades from the old backdrop to this one's still; the shader then rises over the still in FADE_IN seconds,
+// after FADE_WAIT. A one-texel clock notes the first frame, whatever time the app starts the shader's clock at.
+const FADE_WAIT = 0.15
+const FADE_IN = 0.8
+// x: how much of the scene is still hidden, 1 to 0. y: the time the fade starts from. w: 1 once noted.
+const fadeClock: Buffer = buffer({ size: [1, 1], float: 32, filter: 'nearest' }, () => {
+  const last = fadeClock.at(vec2(0, 0))
+  // Frame 0 starts the fade; a clock wiped later (the app may clear buffers) counts as long risen, with no replay.
+  const startAt = last.w > 0.5 ? last.y : first ? time : time - FADE_WAIT - FADE_IN - 1
+  return vec4(1 - smoothstep(startAt + FADE_WAIT, startAt + FADE_WAIT + FADE_IN, time), startAt, 0, 1)
+})
+// The picture or a shape over it, as far as the scene has risen: until then the still shows through.
+function fadingIn(c: vec4): vec4 {
+  return vec4(c * (1 - fadeClock.at(vec2(0, 0)).x))
+}
+
+function viewColor(p: Pixel) {
   const u = unitOf()
   const m = modeBuf.at(vec2(0, 0)).r
   const rest = glim.sample(p.uv)
@@ -1212,24 +1230,11 @@ const view = picture(p => {
   col = mix(col, vec3(col * col * (3 - 2 * col)), 0.28)
   col = vec3(col + (grain.sample(vec2(p.pixel / 128)).r - 0.5) * 0.028)
   return vec4(col, 1)
-})
+}
+const view = picture(p => fadingIn(viewColor(p)))
 
 // The floating leaves, one quad each, turned in the vertex stage.
-const leaves = shapes(
-  { count: 6, instances: 4, cover: 0.03, draw: 'triangles' },
-  (v, i) => {
-    const u = unitOf()
-    const s = afloat.at(vec2(i, 0))
-    const r = afloat.at(vec2(i, 1))
-    const sx = pick6([-1, 1, -1, 1, 1, -1], v)
-    const sy = pick6([-1, -1, 1, -1, 1, 1], v)
-    const half = 26 * u * (0.25 + 0.75 * smoothstep(0, 0.4, r.z))
-    const ca = cos(r.x)
-    const sa = sin(r.x)
-    const w = vec2(s.xy + vec2(sx * ca - sy * sa, sx * sa + sy * ca) * half)
-    return { at: vec2((w / size) * 2 - 1), a: vec4(sx * 26, sy * 26, i, 0) }
-  },
-  s => {
+const leavesPaint = (s: Spot): vec4 => {
     const m = modeBuf.at(vec2(0, 0)).r
     const id = floor(s.a.z + 0.5)
     const d = vec2(s.a.x, s.a.y)
@@ -1247,12 +1252,40 @@ const leaves = shapes(
     // The leaf dents the water: a soft dark foot all round it.
     const foot = smoothstep(edge + 6, edge - 1, rr) * 0.25 * (1 - mk)
     return vec4(c * mk, mk + foot)
+  }
+const leaves = shapes(
+  { count: 6, instances: 4, cover: 0.03, draw: 'triangles' },
+  (v, i) => {
+    const u = unitOf()
+    const s = afloat.at(vec2(i, 0))
+    const r = afloat.at(vec2(i, 1))
+    const sx = pick6([-1, 1, -1, 1, 1, -1], v)
+    const sy = pick6([-1, -1, 1, -1, 1, 1], v)
+    const half = 26 * u * (0.25 + 0.75 * smoothstep(0, 0.4, r.z))
+    const ca = cos(r.x)
+    const sa = sin(r.x)
+    const w = vec2(s.xy + vec2(sx * ca - sy * sa, sx * sa + sy * ca) * half)
+    return { at: vec2((w / size) * 2 - 1), a: vec4(sx * 26, sy * 26, i, 0) }
   },
+  spot => fadingIn(leavesPaint(spot)),
 )
 
 // By night two lights lie on the water as broken columns of glitter: the moon's, cool, on the right, and
 // the lantern's, warm, reaching out from the left bank. The swell breaks them into soft moving glints.
 // One quad each, so the rest of the picture does not pay for them.
+const lightsPaint = (s: Spot): vec4 => {
+    // A glint shows wherever the swell tilts the water just so toward the light, so the glints are soft
+    // patches that come and go and drift with the swell.
+    const rest = glim.sample(s.uv)
+    const tiltA = vec2(vec2(rest.r - 0.5, rest.g - 0.5) * 0.5 - vec2(0.03, 0.045))
+    const tiltB = vec2(vec2(rest.r - 0.5, rest.g - 0.5) * 0.5 + vec2(0.05, -0.015))
+    const threads = exp(-dot(tiltA, tiltA) * 1400) + exp(-dot(tiltB, tiltB) * 1400)
+    const isMoon = s.a.z < 0.5 ? 1 : 0
+    const along = mix(s.a.x, s.a.y, isMoon)
+    const across = mix(s.a.y, s.a.x, isMoon)
+    const glow = exp(-pow(across / mix(30, 34, isMoon), 2) - pow(along / mix(130, 115, isMoon), 2)) * (0.12 + 0.75 * threads) * mix(1, 1.15, isMoon)
+    return vec4(mix(vec3(0.75, 0.48, 0.2), vec3(0.62, 0.68, 0.8), isMoon) * glow * s.a.w, 0)
+  }
 const lights = shapes(
   { count: 6, instances: 2, cover: 0.13, draw: 'triangles', blend: 'add' },
   (v, i) => {
@@ -1265,39 +1298,33 @@ const lights = shapes(
     const night = 1 - modeBuf.at(vec2(0, 0)).r
     return { at: vec2((w / size) * 2 - 1), a: vec4(sx * half.x, sy * half.y, i, night), hide: night < 0.5 }
   },
-  s => {
-    // A glint shows wherever the swell tilts the water just so toward the light, so the glints are soft
-    // patches that come and go and drift with the swell.
-    const rest = glim.sample(s.uv)
-    const tiltA = vec2(vec2(rest.r - 0.5, rest.g - 0.5) * 0.5 - vec2(0.03, 0.045))
-    const tiltB = vec2(vec2(rest.r - 0.5, rest.g - 0.5) * 0.5 + vec2(0.05, -0.015))
-    const threads = exp(-dot(tiltA, tiltA) * 1400) + exp(-dot(tiltB, tiltB) * 1400)
-    const isMoon = s.a.z < 0.5 ? 1 : 0
-    const along = mix(s.a.x, s.a.y, isMoon)
-    const across = mix(s.a.y, s.a.x, isMoon)
-    const glow = exp(-pow(across / mix(30, 34, isMoon), 2) - pow(along / mix(130, 115, isMoon), 2)) * (0.12 + 0.75 * threads) * mix(1, 1.15, isMoon)
-    return vec4(mix(vec3(0.75, 0.48, 0.2), vec3(0.62, 0.68, 0.8), isMoon) * glow * s.a.w, 0)
-  },
+  spot => fadingIn(lightsPaint(spot)),
 )
 
 // Water striders. What shows of one from above is a small brown smudge and, beside it, the four round
 // shadows its feet press into the light on the bottom.
+const stridersPaint = (s: Spot): vec4 => {
+    const dv = vec2((s.coord.x - 0.5) * 34, (s.coord.y - 0.5) * 34)
+    const body = smoothstep(1.6, 0.4, length(vec2(dv.x * 0.3 + 1.2, dv.y + 1)))
+    const foot = vec2(abs(dv.x - 4) - 7.5, abs(dv.y - 4.5) - 5)
+    const dimples = smoothstep(3.4, 1.2, length(foot))
+    return vec4(vec3(0.16, 0.1, 0.05) * body * 0.7, clamp(0.7 * body + 0.3 * dimples, 0, 1))
+  }
 const striders = shapes(
   { count: 1, instances: 2, cover: 0.012, draw: 'points' },
   (v, i) => {
     const s = cast.at(vec2(i, 0))
     return { at: vec2((s.xy / size) * 2 - 1), size: clamp((34 * unitOf()) / px, 1, 64) }
   },
-  s => {
-    const dv = vec2((s.coord.x - 0.5) * 34, (s.coord.y - 0.5) * 34)
-    const body = smoothstep(1.6, 0.4, length(vec2(dv.x * 0.3 + 1.2, dv.y + 1)))
-    const foot = vec2(abs(dv.x - 4) - 7.5, abs(dv.y - 4.5) - 5)
-    const dimples = smoothstep(3.4, 1.2, length(foot))
-    return vec4(vec3(0.16, 0.1, 0.05) * body * 0.7, clamp(0.7 * body + 0.3 * dimples, 0, 1))
-  },
+  spot => fadingIn(stridersPaint(spot)),
 )
 
 // Fireflies drift over the margins at night, each on a slow loop of its own, glowing and fading.
+const fliesPaint = (s: Spot): vec4 => {
+    const d = length(vec2(s.coord - 0.5)) * 2
+    const g = s.a.x * (clamp(1.6 - d * 11, 0, 1) * 0.8 + (0.16 / (1 + d * d * 6)) * smoothstep(1, 0.6, d))
+    return vec4(vec3(0.8, 1, 0.4) * g, 0)
+  }
 const flies = shapes(
   { count: 1, instances: 5, cover: 0.02, draw: 'points', blend: 'add' },
   (v, i) => {
@@ -1305,11 +1332,7 @@ const flies = shapes(
     const night = 1 - modeBuf.at(vec2(0, 0)).r
     return { at: vec2((f.xy / size) * 2 - 1), size: clamp((44 * unitOf()) / px, 1, 64), a: vec4(f.z * night, 0, 0, 0), hide: night < 0.5 }
   },
-  s => {
-    const d = length(vec2(s.coord - 0.5)) * 2
-    const g = s.a.x * (clamp(1.6 - d * 11, 0, 1) * 0.8 + (0.16 / (1 + d * d * 6)) * smoothstep(1, 0.6, d))
-    return vec4(vec3(0.8, 1, 0.4) * g, 0)
-  },
+  spot => fadingIn(fliesPaint(spot)),
 )
 
-export default shader({ fps: 60, passes: [modeBuf, bed, top, overhead, grain, mood, plops, fish, food, cast, stir, wave, afloat, glim, koiLayer, koi, fry, view, lights, leaves, pellets, striders, flies] })
+export default shader({ fps: 60, passes: [fadeClock, modeBuf, bed, top, overhead, grain, mood, plops, fish, food, cast, stir, wave, afloat, glim, koiLayer, koi, fry, view, lights, leaves, pellets, striders, flies] })

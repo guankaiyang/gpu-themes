@@ -11,8 +11,10 @@
 import {
   abs, buffer, clamp, cos, floor, fract, int, length, max, min, mix, PI, picture, pow, px, shader, shapes,
   signed, sin, size, table, time, unsigned, values, vec2, vec3, vec4,
+  smoothstep,
+  first,
 } from 'claude-code/shader'
-import type { Spot } from 'claude-code/shader'
+import type { Spot, Buffer, Pixel } from 'claude-code/shader'
 
 // The harness always sends a variant; Night Reef has one look, so both variants draw the same.
 const params = values({ variant: [0, 1] })
@@ -343,7 +345,24 @@ const violetGlow = (t: number): number =>
 const over = (acc: vec4, color: vec3, a: number): vec4 => vec4(color * a + acc.rgb * (1 - a), a + acc.a * (1 - a))
 
 // Under the animals: the moonlight, the swarms, the reef's breathing tiles, then the halos.
-const view = picture(p => {
+// gpu-themes: the scene fades in when its shader starts, so its moving parts do not pop in over the still. The app
+// crossfades from the old backdrop to this one's still; the shader then rises over the still in FADE_IN seconds,
+// after FADE_WAIT. A one-texel clock notes the first frame, whatever time the app starts the shader's clock at.
+const FADE_WAIT = 0.15
+const FADE_IN = 0.8
+// x: how much of the scene is still hidden, 1 to 0. y: the time the fade starts from. w: 1 once noted.
+const fadeClock: Buffer = buffer({ size: [1, 1], float: 32, filter: 'nearest' }, () => {
+  const last = fadeClock.at(vec2(0, 0))
+  // Frame 0 starts the fade; a clock wiped later (the app may clear buffers) counts as long risen, with no replay.
+  const startAt = last.w > 0.5 ? last.y : first ? time : time - FADE_WAIT - FADE_IN - 1
+  return vec4(1 - smoothstep(startAt + FADE_WAIT, startAt + FADE_WAIT + FADE_IN, time), startAt, 0, 1)
+})
+// The picture or a shape over it, as far as the scene has risen: until then the still shows through.
+function fadingIn(c: vec4): vec4 {
+  return vec4(c * (1 - fadeClock.at(vec2(0, 0)).x))
+}
+
+function viewColor(p: Pixel) {
   const s = scaleOf()
   const vb = vbOf(p.point, s, originOf(s))
   const w = px / s
@@ -385,13 +404,19 @@ const view = picture(p => {
   const h3 = violetGlow(length(vec2((vb.x - turtle.x - 190) / 170, (vb.y - turtle.y - 150) / 180))) * clockOf(TURTLE_VIOLET_HALO)
   acc = over(acc, VIOLET, h3)
   return vec4(acc * (1 + params.variant * 0))
-})
+}
+const view = picture(p => fadingIn(viewColor(p)))
 
 // Covers: the most a draw shows at once at the largest scale (a 7680 x 2160 window, 4.8 points a unit), with a little
 // to spare: 13 halos and 160 specks (0.16 windows); two legs of wake (0.10); the ray's two poses and a turn (174
 // tiles, 1.12); the turtle's body twice and three stroke phases (252 tiles, 1.63).
 // Over the halos, straight onto the picture: each animal's ripples and its two wakes (three bands each), the ray's
 // first. Instances: the ray's 12 ripples and 2 x 3 x 36 wake specks, then the turtle's 16 and 2 x 3 x 66.
+const animSpecksPaint = (s: Spot): vec4 => {
+    const w = s.px / scaleOf()
+    const a = cover(0, s.a.z, s.a.x, w) * cover(0, s.a.w, s.a.y, w) * s.b.x
+    return vec4(vec3(s.b.y > 0.5 ? RIPPLE : TEAL) * a, a)
+  }
 const animSpecks = shapes(
   { count: 6, instances: 640, cover: 0.12, draw: 'triangles' },
   (v, i) => {
@@ -441,21 +466,17 @@ const animSpecks = shapes(
       hide: shown < 0.002,
     }
   },
-  s => {
-    const w = s.px / scaleOf()
-    const a = cover(0, s.a.z, s.a.x, w) * cover(0, s.a.w, s.a.y, w) * s.b.x
-    return vec4(vec3(s.b.y > 0.5 ? RIPPLE : TEAL) * a, a)
-  },
+  spot => fadingIn(animSpecksPaint(spot)),
 )
 const rayTiles = shapes(
   { count: 6, instances: RAY_ROWS * 4, cover: 1.25, draw: 'triangles' },
   (v, i) => tileCorner(v, i, 0),
-  tilePaint,
+  spot => fadingIn(tilePaint(spot)),
 )
 const turtleTiles = shapes(
   { count: 6, instances: TURTLE_ROWS * 4, cover: 1.75, draw: 'triangles' },
   (v, i) => tileCorner(v, i, 1),
-  tilePaint,
+  spot => fadingIn(tilePaint(spot)),
 )
 
-export default shader({ fps: 30, passes: [clocks, mask, atlas, low, lowSpecks, view, animSpecks, rayTiles, turtleTiles] })
+export default shader({ fps: 30, passes: [fadeClock, clocks, mask, atlas, low, lowSpecks, view, animSpecks, rayTiles, turtleTiles] })

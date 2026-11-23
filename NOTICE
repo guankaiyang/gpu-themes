@@ -8,6 +8,9 @@ Changes from theme-examples:
   dither-dunes,vector-range}/: rewritten. Each original CSS-animated scene is redrawn as a still SVG (still.ts)
   plus a GPU shader (shader.ts) for its moving parts.
 - hooks/register.tsx: new. The theme table, picker card, commands and backdrop drawing for this plugin.
-- hooks/scenes/{classic,blueprint,braille-stars,departure-board,teletext-clouds}.ts,
-  hooks/scenes/{duck-pond,falling-sand,field-lines,garden-beetles,koi-pond,ripple-tank,sea-sparkle,semicolony,
-  star-chart}/ and hooks/sounds.ts: copied unchanged.
+- hooks/scenes/{duck-pond,falling-sand,field-lines,garden-beetles,koi-pond,ripple-tank,sea-sparkle,semicolony}/
+  scene.ts: copied, then changed so the scene fades in over its still when its shader starts: a first pass, a
+  one-texel clock, notes the first frame, and the picture and the shapes drawn over it rise with it.
+- The rewritten scenes' shader.ts files fade in the same way.
+- hooks/scenes/{classic,blueprint,braille-stars,departure-board,teletext-clouds}.ts, star-chart/ (its first frame
+  is already its still), the still.ts files of the scenes above, and hooks/sounds.ts: copied unchanged.

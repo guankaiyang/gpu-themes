@@ -3,8 +3,9 @@
 // which reads both and lays the ink and the sheet's faint printing over the paper colour it finds in the Svg.
 import {
   abs, atan, buffer, clamp, dot, dt, exp, floor, fract, int, length, max, min, mix, mod, picture, pointers, px, range, res, scene, shader, sign, signed, sin, size, smoothstep, step, still, time, vec2, vec3, vec4,
+  first,
 } from 'claude-code/shader'
-import type { Buffer } from 'claude-code/shader'
+import type { Buffer, Pixel } from 'claude-code/shader'
 
 // An integer mixer of this file's own: two whole numbers in, 32 scrambled bits out.
 const scramble = (a: number, b: number) => {
@@ -444,7 +445,24 @@ const art = buffer({ scale: 0.25, filter: 'nearest' }, p => {
   return vec4(ink * open + 0.5 * veiled, mix(kind, 5, veiled) / 8, max(max(0.5 * rule, silt), max(max(cross, tally), min(ruler, 1))), tinted)
 })
 
-const sheet = picture(p => {
+// gpu-themes: the scene fades in when its shader starts, so its moving parts do not pop in over the still. The app
+// crossfades from the old backdrop to this one's still; the shader then rises over the still in FADE_IN seconds,
+// after FADE_WAIT. A one-texel clock notes the first frame, whatever time the app starts the shader's clock at.
+const FADE_WAIT = 0.15
+const FADE_IN = 0.8
+// x: how much of the scene is still hidden, 1 to 0. y: the time the fade starts from. w: 1 once noted.
+const fadeClock: Buffer = buffer({ size: [1, 1], float: 32, filter: 'nearest' }, () => {
+  const last = fadeClock.at(vec2(0, 0))
+  // Frame 0 starts the fade; a clock wiped later (the app may clear buffers) counts as long risen, with no replay.
+  const startAt = last.w > 0.5 ? last.y : first ? time : time - FADE_WAIT - FADE_IN - 1
+  return vec4(1 - smoothstep(startAt + FADE_WAIT, startAt + FADE_WAIT + FADE_IN, time), startAt, 0, 1)
+})
+// The picture or a shape over it, as far as the scene has risen: until then the still shows through.
+function fadingIn(c: vec4): vec4 {
+  return vec4(c * (1 - fadeClock.at(vec2(0, 0)).x))
+}
+
+function sheetColor(p: Pixel) {
   // Where this picture pixel is on the sheet, in art pixels.
   const spotX = p.uv.x * art.size.x
   const spotY = p.uv.y * art.size.y
@@ -481,6 +499,7 @@ const sheet = picture(p => {
   const faint = 0.13 * step(0.25, print) + 0.09 * step(0.75, print) + (0.12 - 0.02 * day) * grid + (0.24 - 0.1 * day) * rim
   const ground = vec3(mix(paper, inkTone, faint))
   return vec4(vec3(mix(ground, tone, ink)), 1)
-})
+}
+const sheet = picture(p => fadingIn(sheetColor(p)))
 
-export default shader({ fps: 60, passes: [dwell, art, sheet] })
+export default shader({ fps: 60, passes: [fadeClock, dwell, art, sheet] })

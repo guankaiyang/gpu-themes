@@ -42,8 +42,11 @@ const CHOICE_KEY = 'theme'
 // A session's own choice is stored under this prefix and the session's id.
 const SESSION_PREFIX = 'session:'
 const SESSIONS_KEPT = 200
+// A folder's own choice is stored under this prefix and the folder's path.
+const FOLDER_PREFIX = 'folder:'
+const FOLDERS_KEPT = 200
 const PREVIEW_MS = 20_000
-// How often an open session checks whether another one applied a theme to every session.
+// How often an open session checks whether another one applied a theme to this folder or to every session.
 const FOLLOW_MS = 3_000
 const SCENE_PREFIX = 'gpu-'
 const WINDOWS = ['light', 'dark'] as const
@@ -135,6 +138,7 @@ let previewEnding: Timer | undefined
 let following: Timer | undefined
 // True while a follow check runs.
 let checking = false
+type Scope = NonNullable<GpuChoice['scope']>
 // True once the app has said it takes no theme sounds; a reload learns it again.
 let appLacksSound = false
 // Counts the preview timers started; a timer's end acts only if it is still the last one (an apply calls it off).
@@ -184,7 +188,20 @@ function ownOf(kept: unknown): string | null | undefined {
   return typeof theme === 'string' && themeOf(theme) !== undefined ? theme : undefined
 }
 
-/** The choice every session follows unless it has its own. */
+/** The store key of the choice for the folder this session runs in, its project root. */
+async function folderKey($: EngineInterface): Promise<string | undefined> {
+  const root = await orNothing(() => $.session.root())
+  return root === undefined || root === '' ? undefined : `${FOLDER_PREFIX}${root}`
+}
+
+/** This folder's stored choice: a theme's id, null for "none", or undefined where it has none. */
+async function folderChoice($: EngineInterface): Promise<string | null | undefined> {
+  const key = await folderKey($)
+  if (key === undefined) return undefined
+  return ownOf(await orNothing(() => $.store.get(key)))
+}
+
+/** The choice every session follows unless it or its folder has its own. */
 async function allChoice($: EngineInterface): Promise<string | undefined> {
   return allOf(await orNothing(() => $.store.get(CHOICE_KEY)))
 }
@@ -195,17 +212,25 @@ function allOf(stored: unknown): string | undefined {
 }
 
 /**
- * Stores this session's own choice; past SESSIONS_KEPT, the session that chose longest ago is dropped.
+ * Stores a session's or a folder's own choice; past `kept` of that kind, the one chosen longest ago is dropped.
  * A failed write is put back by `apply`, which notes what the store held first.
  */
-async function keepForSession($: EngineInterface, key: string | undefined, id: string | undefined): Promise<void> {
+async function keep($: EngineInterface, key: string | undefined, id: string | undefined, prefix: string, kept: number): Promise<void> {
   if (key === undefined) return
-  // Out first, so the store's order is the order of the last writes.
-  await $.store.delete(key)
-  await $.store.set(key, { theme: id ?? null })
+  // Written in place, never taken out first: another session reading meanwhile must not find it gone. The time
+  // says which was chosen longest ago.
+  await $.store.set(key, { theme: id ?? null, at: await $.clock.now() })
   await orNothing(async () => {
-    const keys = (await $.store.keys()).filter(name => name.startsWith(SESSION_PREFIX))
-    for (const oldest of keys.slice(0, Math.max(0, keys.length - SESSIONS_KEPT))) await $.store.delete(oldest)
+    const keys = (await $.store.keys()).filter(name => name.startsWith(prefix))
+    if (keys.length <= kept) return
+    const dated: { name: string; at: number }[] = []
+    for (const name of keys) {
+      const value = await $.store.get(name)
+      const at = typeof value === 'object' && value !== null && 'at' in value ? Number((value as { at: unknown }).at) : 0
+      dated.push({ name, at: Number.isFinite(at) ? at : 0 })
+    }
+    dated.sort((a, b) => a.at - b.at)
+    for (const oldest of dated.slice(0, dated.length - kept)) await $.store.delete(oldest.name)
   })
 }
 
@@ -216,6 +241,10 @@ async function show($: EngineInterface, id: string | undefined): Promise<boolean
     await $.theme.clear()
     return true
   }
+  return setTheme($, theme)
+}
+
+async function setTheme($: EngineInterface, theme: GpuTheme): Promise<boolean> {
   const base = { backdrop: { scene: `${SCENE_PREFIX}${theme.id}`, glass: theme.glass }, overrideColorScheme: theme.window }
   if (theme.sound !== undefined && !appLacksSound) {
     // The sound is a try of its own: where the app refuses it, the theme is set without it.
@@ -233,42 +262,51 @@ async function show($: EngineInterface, id: string | undefined): Promise<boolean
 }
 
 /**
- * Applies a theme (or none) to this session, and with `forAll` to every later session. The window changes first;
- * only then is the choice kept. A choice for every session drops this session's own, so it follows again.
+ * Applies a theme (or none) to this session; with scope `folder` to every session in this folder, and with `all`
+ * to every session. The window changes first; only then is the choice kept. A wider choice drops the narrower ones
+ * here (this session's own, and for `all` this folder's), so this session follows it again.
  */
-function apply($: EngineInterface, id: string | undefined, forAll: boolean): Promise<boolean> {
-  return inTurn(() => applyNow($, id, forAll))
+function apply($: EngineInterface, id: string | undefined, scope: Scope): Promise<boolean> {
+  return inTurn(() => applyNow($, id, scope))
 }
 
-async function applyNow($: EngineInterface, id: string | undefined, forAll: boolean): Promise<boolean> {
+async function applyNow($: EngineInterface, id: string | undefined, scope: Scope): Promise<boolean> {
   const stood = await read($, choice)
   const own = await sessionKey($)
+  const folder = await folderKey($)
+  if (scope === 'folder' && folder === undefined) throw new Error('this session has no folder to keep the choice for')
   // What the store held, to put back if a write fails.
-  const heldAll = await $.store.get(CHOICE_KEY)
-  const heldOwn = own === undefined ? undefined : await $.store.get(own)
+  const held = new Map<string, unknown>()
+  const touched = scope === 'all' ? [CHOICE_KEY, folder, own] : scope === 'folder' ? [folder, own] : [own]
+  for (const key of touched) if (key !== undefined) held.set(key, await $.store.get(key))
 
   // A refused set throws here with nothing changed: a preview in progress keeps its timer and ends as usual.
   const drawn = await show($, id)
 
   try {
-    if (forAll) {
-      // The all-sessions choice first, so a failure there leaves this session's own choice in place.
+    if (scope === 'all') {
+      // The all-sessions choice first, so a failure there leaves the narrower ones in place.
       await (id === undefined ? $.store.delete(CHOICE_KEY) : $.store.set(CHOICE_KEY, id))
+      if (folder !== undefined) await $.store.delete(folder)
+      if (own !== undefined) await $.store.delete(own)
+    } else if (scope === 'folder') {
+      await keep($, folder, id, FOLDER_PREFIX, FOLDERS_KEPT)
       if (own !== undefined) await $.store.delete(own)
     } else {
-      await keepForSession($, own, id)
+      await keep($, own, id, SESSION_PREFIX, SESSIONS_KEPT)
     }
     await update($, choice, (was): GpuChoice => ({
       cardInBand: was.cardInBand,
       cardAway: was.cardAway,
       applied: id,
-      scope: forAll ? 'all' : 'session',
+      scope,
     }))
   } catch (error) {
     // Put the store and the window back, so what is shown and what is kept agree; a preview that stood keeps its
     // timer and ends as usual. The first fault is the one told.
-    await orNothing(() => (heldAll === undefined ? $.store.delete(CHOICE_KEY) : $.store.set(CHOICE_KEY, heldAll)))
-    if (own !== undefined) await orNothing(() => (heldOwn === undefined ? $.store.delete(own) : $.store.set(own, heldOwn)))
+    for (const [key, value] of held) {
+      await orNothing(() => (value === undefined ? $.store.delete(key) : $.store.set(key, value)))
+    }
     await orNothing(() => show($, stood.preview ?? stood.applied))
     throw error
   }
@@ -281,19 +319,26 @@ async function applyNow($: EngineInterface, id: string | undefined, forAll: bool
 }
 
 /**
- * The theme this session should show now: where it follows the choice for every session, that choice as the store
- * holds it, which another session may have changed since this one started. A session with its own choice keeps
- * what it shows. So does one whose all-sessions choice was taken off, or is a theme this version does not know:
- * a clear would wipe whatever theme stands, another plugin's included. Rejects where the store cannot be read.
+ * What this session should show now, where another session may have changed a choice since this one started: its
+ * folder's, else the one for every session. Undefined keeps what it shows: a session with its own choice, and one
+ * whose choice was taken off or is a theme this version does not know, since a clear would wipe whatever theme
+ * stands, another plugin's included. Rejects where the store cannot be read.
  */
-async function dueNow($: EngineInterface, now: GpuChoice): Promise<string | undefined> {
-  if (now.scope === 'session') return now.applied
+async function dueNow($: EngineInterface, now: GpuChoice): Promise<{ due: string; scope: Scope } | undefined> {
+  if (now.scope === 'session') return undefined
   const own = await sessionKey($)
-  if (own !== undefined && ownOf(await $.store.get(own)) !== undefined) return now.applied
-  return allOf(await $.store.get(CHOICE_KEY)) ?? now.applied
+  if (own !== undefined && ownOf(await $.store.get(own)) !== undefined) return undefined
+  const folder = await folderKey($)
+  if (folder !== undefined) {
+    const kept = ownOf(await $.store.get(folder))
+    if (kept === null) return undefined
+    if (kept !== undefined) return { due: kept, scope: 'folder' }
+  }
+  const all = allOf(await $.store.get(CHOICE_KEY))
+  return all === undefined ? undefined : { due: all, scope: 'all' }
 }
 
-/** Keeps an open session on the choice for every session; a preview is left to end first. */
+/** Keeps an open session on its folder's choice or the one for every session; a preview is left to end first. */
 async function followAll($: EngineInterface): Promise<void> {
   // One check at a time: where the store is slow, checks must not pile up ahead of a person's Apply.
   if (checking) return
@@ -302,10 +347,10 @@ async function followAll($: EngineInterface): Promise<void> {
     await inTurn(async () => {
       const now = await read($, choice)
       if (now.preview !== undefined) return
-      const due = await dueNow($, now)
-      if (due === now.applied) return
-      await show($, due)
-      await update($, choice, was => ({ ...was, applied: due, scope: 'all' }))
+      const next = await dueNow($, now)
+      if (next === undefined || (next.due === now.applied && next.scope === now.scope)) return
+      if (next.due !== now.applied) await show($, next.due)
+      await update($, choice, was => ({ ...was, applied: next.due, scope: next.scope }))
     })
   } finally {
     checking = false
@@ -318,8 +363,9 @@ async function endPreview($: EngineInterface, id: string, mine: number): Promise
   previewEnding = undefined
   const now = await read($, choice)
   if (now.preview !== id) return
-  // Back to what is due now, so an all-sessions change made during the look shows at once.
-  const back = (await orNothing(() => dueNow($, now))) ?? now.applied
+  // Back to what is due now, so a change another session made during the look shows at once.
+  const next = await orNothing(() => dueNow($, now))
+  const back = next?.due ?? now.applied
   let shown = false
   try {
     await show($, back)
@@ -329,8 +375,8 @@ async function endPreview($: EngineInterface, id: string, mine: number): Promise
     await update($, choice, was =>
       was.preview !== id
         ? was
-        : shown && back !== was.applied
-          ? { ...was, preview: undefined, applied: back, scope: 'all' }
+        : shown && next !== undefined
+          ? { ...was, preview: undefined, applied: next.due, scope: next.scope }
           : { ...was, preview: undefined },
     )
   }
@@ -373,9 +419,9 @@ async function putCardAway($: EngineInterface): Promise<void> {
 }
 
 /** A pick on the card: applied, and the card put away as a menu closes on a choice. A fault keeps the card up. */
-async function pick($: EngineInterface, theme: GpuTheme | undefined, forAll: boolean): Promise<void> {
+async function pick($: EngineInterface, theme: GpuTheme | undefined, scope: Scope): Promise<void> {
   try {
-    const drawn = await apply($, theme?.id, forAll)
+    const drawn = await apply($, theme?.id, scope)
     if (!drawn) void $.ui.toast('If no theme shows, this window may not draw themes yet. Your choice is saved.')
   } catch (error) {
     void $.ui.toast(
@@ -392,7 +438,7 @@ type CardElements = Pick<ReturnType<EngineInterface['ui']['resolve']>, 'Box' | '
 
 /**
  * The card, laid out as theme-examples' own: Close and No theme at its head, then each theme under the kind of
- * window it is made for, with its title, its three buttons and its blurb. The desktop draws a button's `label`
+ * window it is made for, with its title, its four buttons and its blurb. The desktop draws a button's `label`
  * and not its children, so both carry the same short word.
  */
 function card($: EngineInterface, { Box, Text, Button }: CardElements, now: GpuChoice) {
@@ -400,7 +446,7 @@ function card($: EngineInterface, { Box, Text, Button }: CardElements, now: GpuC
     <Box flexDirection="column" borderStyle="round" paddingX={1} gap="md">
       <Box flexDirection="row" gap={1}>
         <Text bold>GPU themes</Text>
-        <Button key="off" label="No theme" onPress={() => pick($, undefined, true)}>
+        <Button key="off" label="No theme" onPress={() => pick($, undefined, 'all')}>
           No theme
         </Button>
         <Button key="close" label="Close" role="dismiss" autoFocus onPress={() => putCardAway($)}>
@@ -412,7 +458,8 @@ function card($: EngineInterface, { Box, Text, Button }: CardElements, now: GpuC
           <Text key={`head-${window}`} size="heading" bold>{`For ${window} windows`}</Text>
           {THEMES.filter(theme => theme.window === window).map(theme => {
             const isOn = now.applied === theme.id
-            const applyWord = isOn && now.scope !== 'session' ? 'Applied' : 'Apply'
+            const applyWord = isOn && (now.scope ?? 'all') === 'all' ? 'Applied' : 'Apply'
+            const folderWord = isOn && now.scope === 'folder' ? '✓ This folder' : 'This folder'
             const sessionWord = isOn && now.scope === 'session' ? '✓ This session' : 'This session'
             const previewWord = now.preview === theme.id ? 'Previewing' : 'Preview'
 
@@ -424,10 +471,13 @@ function card($: EngineInterface, { Box, Text, Button }: CardElements, now: GpuC
                     {theme.title}
                   </Text>
                   <Box flexDirection="row" gap={1}>
-                    <Button key={`apply-${theme.id}`} label={applyWord} onPress={() => pick($, theme, true)}>
+                    <Button key={`apply-${theme.id}`} label={applyWord} onPress={() => pick($, theme, 'all')}>
                       {applyWord}
                     </Button>
-                    <Button key={`session-${theme.id}`} label={sessionWord} onPress={() => pick($, theme, false)}>
+                    <Button key={`folder-${theme.id}`} label={folderWord} onPress={() => pick($, theme, 'folder')}>
+                      {folderWord}
+                    </Button>
+                    <Button key={`session-${theme.id}`} label={sessionWord} onPress={() => pick($, theme, 'session')}>
                       {sessionWord}
                     </Button>
                     <Button key={`preview-${theme.id}`} label={previewWord} onPress={() => preview($, theme)}>
@@ -452,16 +502,22 @@ function list(): string {
   return [
     `Themes (${THEMES.length}; * rebuilt on the GPU):`,
     ...THEMES.map(theme => `  ${REBUILT.includes(theme.scene) ? '*' : ' '} ${theme.id}: ${theme.title} (${theme.window} windows)`),
-    `/${COMMAND} alone opens the picker. /${COMMAND} <name> applies one to every session; add "session" for this session only. /${COMMAND} off clears it.`,
+    `/${COMMAND} alone opens the picker. /${COMMAND} <name> applies one to every session; add "folder" for this folder only, or "session" for this session only. /${COMMAND} off clears it.`,
   ].join('\n')
+}
+
+const SCOPE_WORDS: Record<Scope, string> = {
+  session: 'for this session only',
+  folder: 'for every session in this folder',
+  all: 'for every session',
 }
 
 async function answer($: EngineInterface, args: string): Promise<string> {
   const words = args.trim().split(/\s+/).filter(word => word !== '')
   const last = words.at(-1)?.toLowerCase()
-  // "session" as the last of two or more words: this session only.
-  const forAll = !(words.length > 1 && last === 'session')
-  const name = (forAll ? words : words.slice(0, -1)).join(' ')
+  // "session" or "folder" as the last of two or more words: this session or this folder only.
+  const scope: Scope = words.length > 1 && (last === 'session' || last === 'folder') ? last : 'all'
+  const name = (scope === 'all' ? words : words.slice(0, -1)).join(' ')
   const word = keyOf(name)
 
   if (word === '') {
@@ -477,24 +533,28 @@ async function answer($: EngineInterface, args: string): Promise<string> {
     const now = await read($, choice)
     const theme = themeOf(now.applied)
     if (theme === undefined) return 'No GPU theme is on.'
-    return `${theme.title} is on, ${now.scope === 'session' ? 'for this session only' : 'for every session'}.`
+    return `${theme.title} is on, ${SCOPE_WORDS[now.scope ?? 'all']}.`
   }
 
   if (word === 'off') {
-    await apply($, undefined, forAll)
-    return forAll
+    await apply($, undefined, scope)
+    return scope === 'all'
       ? 'GPU theme off for every session. Open sessions keep what they show until they start again. Pick any theme again with /custom-theme or /gpu-theme.'
-      : 'GPU theme off for this session only.'
+      : scope === 'folder'
+        ? 'GPU theme off for this folder. Other open sessions here keep what they show until they start again.'
+        : 'GPU theme off for this session only.'
   }
 
   const theme = themeNamed(name)
   if (theme === undefined) return `No GPU theme named "${name}". ${list()}`
 
-  const drawn = await apply($, theme.id, forAll)
+  const drawn = await apply($, theme.id, scope)
   return (
-    (forAll
+    (scope === 'all'
       ? `${theme.title} applied to every session, open ones included.`
-      : `${theme.title} applied to this session only.`) +
+      : scope === 'folder'
+        ? `${theme.title} applied to every session in this folder, open ones included.`
+        : `${theme.title} applied to this session only.`) +
     ` Made for ${theme.window} windows.` +
     (drawn ? '' : ' This window may not draw themes yet.')
   )
@@ -580,7 +640,7 @@ export const register: Register = on => {
       await $.command.register({
         name: COMMAND,
         description: 'Pick an animated theme that does not lag the chat. Add a name to apply it, "list" to see all, "off" to clear.',
-        argumentHint: '[name [session]|list|status|off]',
+        argumentHint: '[name [folder|session]|list|status|off [folder|session]]',
       })
     } catch (error) {
       void $.ui.toast(`${PLUGIN}: /${COMMAND} is not available (${String(error)})`)
@@ -601,10 +661,21 @@ export const register: Register = on => {
     try {
       // In turn: a press on a card left open across a reload must not cross it.
       await inTurn(async () => {
-        // This session's own choice wins; else the one every session follows.
+        // This session's own choice wins; else its folder's; else the one every session follows.
         const own = await sessionChoice($)
-        const due = own === undefined ? await allChoice($) : own ?? undefined
-        const scope: GpuChoice['scope'] = own === undefined ? 'all' : 'session'
+        const folder = own === undefined ? await folderChoice($) : undefined
+        let due: string | undefined
+        let scope: Scope
+        if (own !== undefined) {
+          due = own ?? undefined
+          scope = 'session'
+        } else if (folder !== undefined) {
+          due = folder ?? undefined
+          scope = 'folder'
+        } else {
+          due = await allChoice($)
+          scope = 'all'
+        }
         await update($, choice, was => ({ ...was, applied: due, scope }))
         // Nothing due: leave the window alone, so another plugin's theme stays.
         if (due !== undefined) await show($, due)
@@ -615,7 +686,7 @@ export const register: Register = on => {
       })
     }
 
-    // From now on, follow what any other session applies to every session.
+    // From now on, follow what any other session applies to this folder or to every session.
     following?.cancel()
     following = $.clock.every(FOLLOW_MS, () => {
       void orNothing(() => followAll($))
@@ -656,7 +727,8 @@ export const register: Register = on => {
 
     const { Shader, Svg } = $.ui.resolve(e)
     const isRebuilt = REBUILT.includes(theme.scene)
-    // theme-examples' own scenes take the pointer (its shaders follow it); the rebuilt ones do not.
+    // theme-examples' own scenes take the pointer (its shaders follow it); the rebuilt ones do not. (A rebuilt still
+    // drawn in a frame instead was tried: the app still cut to it, after a white flash while the frame loaded.)
     const still = isRebuilt ? (
       <Svg alt={`${theme.title}, drawn on the GPU`} source={stillOf(theme)} />
     ) : (

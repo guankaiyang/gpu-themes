@@ -47,7 +47,7 @@ const RUN = { command: 'gpu-theme', origin: { kind: 'composer' }, presentation: 
 const CARD = { plugin: 'gpu-themes', surface: 'desktop', component: 'Placed', props: { id: 'gpu-theme-card', plugin: 'gpu-themes' } } as const
 
 /** Stands for the engine: records every theme set and clear. */
-type Fail = { set?: (scene: string) => boolean; store?: boolean; get?: boolean; noSession?: boolean }
+type Fail = { set?: (scene: string) => boolean; store?: boolean; get?: boolean; noSession?: boolean; noFolder?: boolean; del?: boolean }
 
 function engine(on: Parameters<Parameters<typeof test>[1]>[1], fail: Fail = {}, placed = true) {
   const shown: (string | undefined)[] = []
@@ -55,6 +55,8 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], fail: Fail = {}, 
   const gate: { wait?: Promise<void>; getHold?: Promise<void>; holdNextGet?: boolean } = {}
   // The store in memory, readable by the test.
   const store = new Map<string, unknown>()
+  // Every key written, in order.
+  const writes: string[] = []
   on('store.get', async (_, e) => {
     if (fail.get) throw new Error('store down')
     const key = (e as { key: string }).key
@@ -71,11 +73,12 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], fail: Fail = {}, 
     if (fail.store) throw new Error('store down')
     if (gate.wait) await gate.wait
     const { key, value } = e as { key: string; value: unknown }
+    writes.push(key)
     store.set(key, value)
     return { value: undefined }
   })
   on('store.delete', (_, e) => {
-    if (fail.store) throw new Error('store down')
+    if (fail.store || fail.del) throw new Error('store down')
     store.delete((e as { key: string }).key)
     return { value: undefined }
   })
@@ -93,19 +96,21 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], fail: Fail = {}, 
     return { value: { isDrawn: false, reason: 'cleared' } }
   })
   on('session.id', () => ({ value: fail.noSession ? '' : 'test-session' }))
+  on('session.root', () => ({ value: fail.noFolder ? '' : '/proj' }))
   on('env.get', () => ({ value: undefined }))
   on('command.register', () => ({ value: { command: 'gpu-theme' } }))
   on('session.start', (_, e) => ({ cwd: (e as { cwd: string }).cwd }))
-  return { shown, clock, store, gate }
+  return { shown, clock, store, gate, writes }
 }
 
-test('/gpu-theme alone opens the card with Apply, This session and Preview for every theme', async ($, on) => {
+test('/gpu-theme alone opens the card with Apply, This folder, This session and Preview for every theme', async ($, on) => {
   engine(on)
   const said = await $.command.run({ ...RUN, args: '' })
   expect(said.text).toBe('Pick a GPU theme on the card.')
   const ui = await $.ui.mount(CARD)
   for (const id of ALL_IDS) {
     expect(await ui.find({ key: `apply-${id}` })).toBeDefined()
+    expect(await ui.find({ key: `folder-${id}` })).toBeDefined()
     expect(await ui.find({ key: `session-${id}` })).toBeDefined()
     expect(await ui.find({ key: `preview-${id}` })).toBeDefined()
   }
@@ -138,7 +143,7 @@ test('This session keeps the choice for this session only', async ($, on) => {
   await ui.press({ key: 'session-vector-range' })
   expect(shown.at(-1)).toBe('gpu-vector-range')
   expect(store.get('theme')).toBe('koi-mosaic')
-  expect(store.get('session:test-session')).toEqual({ theme: 'vector-range' })
+  expect(store.get('session:test-session')).toMatchObject({ theme: 'vector-range' })
   await ui.unmount()
   // A new start of this session takes its own choice, not the all-sessions one.
   const before = shown.length
@@ -243,10 +248,10 @@ test('a store failure on Apply puts the window and the store back', async ($, on
   await ui.press({ key: 'apply-koi-mosaic' })
   expect(shown.at(-1)).toBe('gpu-night-reef')
   expect(store.get('theme')).toBe('deep-water')
-  expect(store.get('session:test-session')).toEqual({ theme: 'night-reef' })
+  expect(store.get('session:test-session')).toMatchObject({ theme: 'night-reef' })
   await ui.press({ key: 'session-honu-lagoon' })
   expect(shown.at(-1)).toBe('gpu-night-reef')
-  expect(store.get('session:test-session')).toEqual({ theme: 'night-reef' })
+  expect(store.get('session:test-session')).toMatchObject({ theme: 'night-reef' })
   const status = await $.command.run({ ...RUN, args: 'status' })
   expect(status.text).toMatch(/Night Reef .* this session only/)
   await ui.unmount()
@@ -495,4 +500,173 @@ test('a preview is not cut short by an all-sessions change; the change follows o
   expect(shown.slice(-3)).toEqual(['gpu-koi-mosaic', 'gpu-snow-pines', 'gpu-honu-lagoon'])
   expect((await $.command.run({ ...RUN, args: 'status' })).text).toMatch(/Honu Lagoon .* every session/)
   await ui.unmount()
+})
+
+// --- This folder ---
+
+const FOLDER = 'folder:/proj'
+const backdrop = (id: string) =>
+  ({ plugin: 'gpu-themes', surface: 'desktop', component: 'Backdrop', props: { scene: `gpu-${id}`, plugin: 'gpu-themes', glass: GLASS } }) as const
+
+test('This folder keeps the choice for every session in this folder', async ($, on) => {
+  const { shown, store } = engine(on)
+  store.set('theme', 'koi-mosaic')
+  store.set('session:test-session', { theme: 'ember' })
+  await $.command.run({ ...RUN, args: '' })
+  const ui = await $.ui.mount(CARD)
+  await ui.press({ key: 'folder-honu-lagoon' })
+  expect(shown.at(-1)).toBe('gpu-honu-lagoon')
+  expect(store.get(FOLDER)).toMatchObject({ theme: 'honu-lagoon' })
+  expect(store.get('theme')).toBe('koi-mosaic')
+  // This session follows its folder again.
+  expect(store.has('session:test-session')).toBe(false)
+  await ui.unmount()
+  await $.command.run({ ...RUN, args: '' })
+  const again = await $.ui.mount(CARD)
+  expect((await again.find({ key: 'folder-honu-lagoon' }))?.props.label).toBe('✓ This folder')
+  expect((await again.find({ key: 'apply-honu-lagoon' }))?.props.label).toBe('Apply')
+  await again.unmount()
+  expect((await $.command.run({ ...RUN, args: 'status' })).text).toMatch(/Honu Lagoon .* every session in this folder/)
+})
+
+test("at a start a session's own choice wins, then its folder's, then the one for every session", async ($, on) => {
+  const { shown, store } = engine(on)
+  store.set('theme', 'koi-mosaic')
+  store.set(FOLDER, { theme: 'honu-lagoon' })
+  await $.session.start(START)
+  expect(shown.at(-1)).toBe('gpu-honu-lagoon')
+  store.set('session:test-session', { theme: 'ember' })
+  await $.session.start(START)
+  expect(shown.at(-1)).toBe('gpu-ember')
+  store.delete('session:test-session')
+  store.delete(FOLDER)
+  await $.session.start(START)
+  expect(shown.at(-1)).toBe('gpu-koi-mosaic')
+})
+
+test("Apply for every session drops this folder's choice; other folders keep theirs", async ($, on) => {
+  const { store } = engine(on)
+  store.set(FOLDER, { theme: 'honu-lagoon' })
+  store.set('folder:/elsewhere', { theme: 'ember' })
+  await $.command.run({ ...RUN, args: 'vector-range' })
+  expect(store.get('theme')).toBe('vector-range')
+  expect(store.has(FOLDER)).toBe(false)
+  expect(store.get('folder:/elsewhere')).toEqual({ theme: 'ember' })
+})
+
+test('"<name> folder" and "off folder" on the command line', async ($, on) => {
+  const { shown, store } = engine(on)
+  const said = await $.command.run({ ...RUN, args: 'honu lagoon folder' })
+  expect(said.text).toMatch(/Honu Lagoon applied to every session in this folder/)
+  expect(store.get(FOLDER)).toMatchObject({ theme: 'honu-lagoon' })
+  const off = await $.command.run({ ...RUN, args: 'off folder' })
+  expect(off.text).toMatch(/off for this folder/)
+  expect(store.get(FOLDER)).toMatchObject({ theme: null })
+  expect(shown.at(-1)).toBeUndefined()
+})
+
+test('This folder is refused where the session has no folder, and nothing changes', async ($, on) => {
+  const { shown, store } = engine(on, { noFolder: true })
+  const said = await $.command.run({ ...RUN, args: 'honu-lagoon folder' })
+  expect(said.text).toMatch(/That did not work: .*no folder/)
+  expect(shown.length).toBe(0)
+  expect([...store.keys()]).toEqual([])
+})
+
+test("an open session follows its folder's choice, made in another session there, over the all-sessions one", async ($, on) => {
+  const { shown, store, clock } = engine(on)
+  store.set('theme', 'koi-mosaic')
+  await $.session.start(START)
+  store.set(FOLDER, { theme: 'honu-lagoon' })
+  await clock.advance(3_000)
+  expect(shown.at(-1)).toBe('gpu-honu-lagoon')
+  expect((await $.command.run({ ...RUN, args: 'status' })).text).toMatch(/every session in this folder/)
+  // A change for every session does not reach a folder with its own choice.
+  const before = shown.length
+  store.set('theme', 'ember')
+  await clock.advance(9_000)
+  expect(shown.length).toBe(before)
+  // Its folder's choice taken off elsewhere: this session keeps what it shows.
+  store.set(FOLDER, { theme: null })
+  await clock.advance(9_000)
+  expect(shown.length).toBe(before)
+})
+
+test('a This folder choice is not undone by the follow check', async ($, on) => {
+  const { shown, store, clock } = engine(on)
+  store.set('theme', 'koi-mosaic')
+  await $.session.start(START)
+  await $.command.run({ ...RUN, args: 'honu-lagoon folder' })
+  const before = shown.length
+  await clock.advance(9_000)
+  expect(shown.length).toBe(before)
+  expect(shown.at(-1)).toBe('gpu-honu-lagoon')
+})
+
+test('at a start, a folder turned off beats the all-sessions choice', async ($, on) => {
+  const { shown, store } = engine(on)
+  store.set('theme', 'koi-mosaic')
+  store.set(FOLDER, { theme: null })
+  await $.session.start(START)
+  expect(shown.length).toBe(0)
+  expect((await $.command.run({ ...RUN, args: 'status' })).text).toBe('No GPU theme is on.')
+})
+
+test('a store failure on This folder puts back only what it wrote, and the window', async ($, on) => {
+  const fail: Fail = {}
+  const { shown, store, writes } = engine(on, fail)
+  await $.command.run({ ...RUN, args: 'koi-mosaic' })
+  store.set('session:test-session', { theme: 'ember' })
+  // The folder's choice is written; dropping this session's own then fails.
+  fail.del = true
+  writes.length = 0
+  const said = await $.command.run({ ...RUN, args: 'honu-lagoon folder' })
+  expect(said.text).toMatch(/did not work/)
+  expect(shown.at(-1)).toBe('gpu-koi-mosaic')
+  expect(store.get('session:test-session')).toEqual({ theme: 'ember' })
+  // The all-sessions choice was never written, by the folder write or the rollback.
+  expect(writes.includes('theme')).toBe(false)
+  expect(store.get('theme')).toBe('koi-mosaic')
+})
+
+test('past 200 folders, the one chosen longest ago is dropped, not one chosen again since', async ($, on) => {
+  const { store, clock } = engine(on)
+  for (let index = 0; index < 200; index += 1) store.set(`folder:/f${index}`, { theme: 'ember', at: 1_000 + index })
+  // /f0 is the first stored, but chosen again just now.
+  store.set('folder:/f0', { theme: 'ember', at: 10_000 })
+  await clock.advance(20_000)
+  await $.command.run({ ...RUN, args: 'honu-lagoon folder' })
+  expect(store.has('folder:/f0')).toBe(true)
+  expect(store.has('folder:/f1')).toBe(false)
+  expect(store.has(FOLDER)).toBe(true)
+  expect([...store.keys()].filter(key => key.startsWith('folder:')).length).toBe(200)
+})
+
+// --- The change from one theme to the next ---
+
+// The app crossfades from the old backdrop to the new one's still; each shader then fades its own picture in over that
+// still (a clock of its own, in the shader file: nothing a test here can run). The mod adds nothing to the change.
+
+test('a change of theme is one set, at once: nothing waits, and the still is drawn as it is', async ($, on) => {
+  const { shown } = engine(on)
+  await $.command.run({ ...RUN, args: 'koi-mosaic' })
+  let ui = await $.ui.mount(backdrop('koi-mosaic'))
+  await ui.unmount()
+  // No time passes on the mocked clock: a wait would hold this command forever.
+  await $.command.run({ ...RUN, args: 'honu-lagoon' })
+  expect(shown.slice(-2)).toEqual(['gpu-koi-mosaic', 'gpu-honu-lagoon'])
+  ui = await $.ui.mount(backdrop('honu-lagoon'))
+  expect(String((await ui.find({ type: 'Svg' }))?.props.source)).not.toContain('gpu-themes-')
+  await ui.unmount()
+})
+
+test("each shader is given only the values its file declares: a rebuilt scene's variant, or none", async $ => {
+  for (const id of [...IDS, ...SHADER_IDS]) {
+    const ui = await $.ui.mount(backdrop(id))
+    const values = (await ui.find({ type: 'Shader' }))?.props.values
+    // Koi Mosaic's shader has one look, and theme-examples' own take nothing from this mod.
+    if (IDS.includes(id) && id !== 'koi-mosaic') expect(Object.keys(values as object), id).toEqual(['variant'])
+    else expect(values, id).toBeUndefined()
+    await ui.unmount()
+  }
 })

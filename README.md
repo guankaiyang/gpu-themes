@@ -34,13 +34,21 @@ Backdrops are drawn by the Claude desktop app.
 
 ## Use
 
-`/gpu-theme` alone opens a picker card, laid out like theme-examples' own. Each theme has three buttons:
-**Apply** (every session), **This session** (this session only) and **Preview** (shows it for 20 seconds, then goes back).
-The card also has **No theme** and **Close**.
+`/gpu-theme` alone opens a picker card, laid out like theme-examples' own. Each theme has four buttons:
+**Apply** (every session), **This folder** (every session in this folder), **This session** (this session only)
+and **Preview** (shows it for 20 seconds, then goes back). The card also has **No theme** and **Close**.
 
-From the command line: `/gpu-theme <name>` (every session), `/gpu-theme <name> session` (this session only),
-`/gpu-theme list`, `/gpu-theme status`, `/gpu-theme off` (add `session` to clear this session only).
-A session's own choice wins over the all-sessions one. Other open sessions follow an all-sessions Apply within a few seconds, unless they have their own. An all-sessions "off" reaches them at their next start, so that it never wipes another plugin's theme.
+From the command line: `/gpu-theme <name>` (every session), `/gpu-theme <name> folder` (this folder),
+`/gpu-theme <name> session` (this session only), `/gpu-theme list`, `/gpu-theme status`, `/gpu-theme off`
+(add `folder` or `session` to clear only that).
+
+A session's own choice wins, then its folder's, then the all-sessions one. Apply for every session drops this
+folder's choice and this session's own; other folders keep theirs. Other open sessions follow a new Apply within a
+few seconds, unless a narrower choice of theirs wins. An "off" reaches them at their next start, so that it never
+wipes another plugin's theme.
+
+When the theme changes, the app fades from the old scene to the new one. A scene's moving parts then fade in over its
+still picture in under a second, instead of popping in.
 
 The window has one backdrop. A pick on theme-examples' own `/custom-theme` card replaces this mod's theme in that
 window; pick on `/gpu-theme` again to bring it back. Under Reduce Motion, or where the app plays no shader, the still

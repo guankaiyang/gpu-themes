@@ -6,7 +6,10 @@
 import {
   PI, abs, clamp, dot, floor, fract, int, length, max, min, mix, picture, pointers, range,
   scene, shader, sin, size, smoothstep, time, unsigned, vec2, vec3, vec4,
+  buffer,
+  first,
 } from 'claude-code/shader'
+import type { Buffer, Pixel } from 'claude-code/shader'
 
 // One paper square, in points. Rules run every square, heavier every fifth.
 const G = 28
@@ -45,7 +48,24 @@ const toStroke = (q: vec2, mid: vec2, way: vec2, halfLong: number) => {
 // How strong a field of this size reads, 0 far from every pole to 1 beside one.
 const grade = (pull: number) => clamp((pull * NEAR / (pull * NEAR + 1) - 0.3) / 0.45, 0, 1)
 
-const sheet = picture(p => {
+// gpu-themes: the scene fades in when its shader starts, so its moving parts do not pop in over the still. The app
+// crossfades from the old backdrop to this one's still; the shader then rises over the still in FADE_IN seconds,
+// after FADE_WAIT. A one-texel clock notes the first frame, whatever time the app starts the shader's clock at.
+const FADE_WAIT = 0.15
+const FADE_IN = 0.8
+// x: how much of the scene is still hidden, 1 to 0. y: the time the fade starts from. w: 1 once noted.
+const fadeClock: Buffer = buffer({ size: [1, 1], float: 32, filter: 'nearest' }, () => {
+  const last = fadeClock.at(vec2(0, 0))
+  // Frame 0 starts the fade; a clock wiped later (the app may clear buffers) counts as long risen, with no replay.
+  const startAt = last.w > 0.5 ? last.y : first ? time : time - FADE_WAIT - FADE_IN - 1
+  return vec4(1 - smoothstep(startAt + FADE_WAIT, startAt + FADE_WAIT + FADE_IN, time), startAt, 0, 1)
+})
+// The picture or a shape over it, as far as the scene has risen: until then the still shows through.
+function fadingIn(c: vec4): vec4 {
+  return vec4(c * (1 - fadeClock.at(vec2(0, 0)).x))
+}
+
+function sheetColor(p: Pixel) {
   const at = p.point
   const perPixel = 1 / p.px
   // How much of a pixel a mark covers: gap is the distance to its middle line, half its half width.
@@ -244,6 +264,7 @@ const sheet = picture(p => {
   color = vec3(mix(color, lead, inkLead))
   color = vec3(mix(color, redLead, inkRed))
   return vec4(color, 1)
-})
+}
+const sheet = picture(p => fadingIn(sheetColor(p)))
 
-export default shader({ fps: 30, passes: [sheet] })
+export default shader({ fps: 30, passes: [fadeClock, sheet] })
