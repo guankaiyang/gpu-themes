@@ -857,3 +857,27 @@ test('a reload starts Koi Pond quiet', async ($, on) => {
   await $.session.start(START)
   expect(await pond($)).toEqual(QUIET)
 })
+
+test('an answer that ends with a question has the pond wait with you until your next turn', async ($, on) => {
+  pondEngine(on)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete({ ...end('t1'), answer: 'Done. Shall I push it, or hold off?' } as Complete)
+  expect((await pond($)).waiting).toBe(1)
+  // Your reply starts the next turn: no longer waited for.
+  await $.turn.start({ text: 'push', turnId: 't2' })
+  expect((await pond($)).waiting).toBe(0)
+  // An answer that asks nothing leaves the koi free; so does a stopped turn, whatever it said.
+  await $.turn.complete({ ...end('t2'), answer: 'Pushed.' } as Complete)
+  expect((await pond($)).waiting).toBe(0)
+  await $.turn.start({ text: 'go', turnId: 't3' })
+  await $.turn.complete({ ...end('t3'), answer: 'Which one?', isAborted: true, reason: 'aborted' } as Complete)
+  expect((await pond($)).waiting).toBe(0)
+  // A question mark inside closing marks still counts.
+  await $.turn.start({ text: 'go', turnId: 't4' })
+  await $.turn.complete({ ...end('t4'), answer: 'Is it **smooth now?**' } as Complete)
+  expect((await pond($)).waiting).toBe(1)
+  // And the full-width question mark.
+  await $.turn.start({ text: 'go', turnId: 't5' })
+  await $.turn.complete({ ...end('t5'), answer: '\u8981\u63a8\u9001\u5417\uff1f' } as Complete)
+  expect((await pond($)).waiting).toBe(1)
+})

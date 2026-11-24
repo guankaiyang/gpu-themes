@@ -20,7 +20,7 @@ export type GpuActivity = {
   busy?: number
   /** How many tool calls came in the last 20 seconds, as a level from 0 to 3. */
   pace?: number
-  /** 1 while Claude waits for your answer to a question. */
+  /** 1 while Claude waits for your answer: a question is open, or Claude's last reply ended with one. */
   waiting?: number
   /** 1 for 30 seconds after a file is written. */
   making?: number

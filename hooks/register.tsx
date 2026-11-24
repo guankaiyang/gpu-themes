@@ -694,12 +694,22 @@ let mainBusy = false
 const helpersAtWork = new Set<string>()
 const finished = new Set<string>()
 let asksOpen = 0
+// True from the end of a turn whose answer ends with a question to you, until your next turn starts.
+let replyAwaited = false
 let recentCalls: number[] = []
 let paceCheck: Timer | undefined
 let makingEnd: Timer | undefined
 let told: Promise<unknown> = Promise.resolve()
 // Counts the session's starts: books kept for an earlier one are dropped.
 let era = 0
+
+/**
+ * Whether an answer ends by asking you something: it ends with a question mark (or the full-width one), past any
+ * closing marks.
+ */
+const endsAsking = (answer: string): boolean => /[?\uff1f]["'\u201d\u2019)\]*_`]*\s*$/.test(answer.trim())
+/** The pond waits with you while a question is open, or since an answer asked you something. */
+const waitingNow = (): number => (asksOpen > 0 || replyAwaited ? 1 : 0)
 
 const paceOf = (calls: number): number => (calls === 0 ? 0 : calls < 3 ? 1 : calls < 6 ? 2 : 3)
 const atWork = (): boolean => mainBusy || helpersAtWork.size > 0
@@ -710,6 +720,7 @@ function clearPond(): void {
   helpersAtWork.clear()
   finished.clear()
   asksOpen = 0
+  replyAwaited = false
   recentCalls = []
   paceCheck?.cancel()
   makingEnd?.cancel()
@@ -849,7 +860,9 @@ export const register: Register = on => {
     const id = e.agentId
     if (id === undefined) {
       mainBusy = true
-      tell($, was => ({ ...was, busy: 1 }))
+      // Your reply has come: no longer waited for.
+      replyAwaited = false
+      tell($, was => ({ ...was, busy: 1, waiting: waitingNow() }))
     } else {
       finished.delete(id)
       const mine = era
@@ -868,7 +881,9 @@ export const register: Register = on => {
     const id = e.agentId
     if (id === undefined) {
       mainBusy = false
-      tell($, was => ({ ...was, busy: 0 }))
+      // An answer that ends by asking you something: the pond waits with you until you reply.
+      replyAwaited = !e.isAborted && endsAsking(e.answer)
+      tell($, was => ({ ...was, busy: 0, waiting: waitingNow() }))
     } else {
       finished.add(id)
       helpersAtWork.delete(id)
@@ -896,7 +911,7 @@ export const register: Register = on => {
       return await next(e)
     } finally {
       asksOpen = Math.max(0, asksOpen - 1)
-      if (asksOpen === 0) tell($, was => ({ ...was, waiting: 0 }))
+      tell($, was => ({ ...was, waiting: waitingNow() }))
     }
   }).catch(($, e, next) => next(e)) // Should this hook fail, the call goes on as it came (next is replay-safe).
 
